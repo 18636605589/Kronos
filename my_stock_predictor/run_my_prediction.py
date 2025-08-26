@@ -1,0 +1,277 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+================================================
+=== Kronos 股票预测系统 - 统一执行脚本 ===
+================================================
+
+这是您的主要预测入口点。
+您只需修改下面的 `PREDICTION_CONFIG` 部分，
+然后直接运行此脚本即可。
+
+用法:
+    python my_stock_predictor/run_my_prediction.py
+"""
+
+import os
+import sys
+import re
+import pandas as pd
+from datetime import datetime, timedelta
+
+# 确保脚本可以找到我们创建的模块
+# 这将当前文件所在的目录添加到Python的搜索路径中
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
+from stock_data_fetcher import StockDataFetcher
+from stock_predictor import StockPredictor
+
+# ==============================================================================
+# === 预测配置 (您需要修改的部分) ===
+# ==============================================================================
+PREDICTION_CONFIG = {
+    # --- 股票信息 ---
+    "symbol": "300708",          # 股票代码 (例如: A股 '600519', 美股 'NVDA')
+    "source": "akshare",        # 数据源 ('akshare' for A股, 'yfinance' for 美股/全球)
+    
+    # --- 数据获取时间范围 ---
+    "start_date": "2024-01-01", # 数据开始日期
+    "end_date": "2025-08-25",   # 数据结束日期
+    "period": "5",              # 数据频率 ('5', '15', '30', '60' for 分钟, 'D' for 日线)
+
+    # --- 预测参数 (使用带有单位的时间字符串) ---
+    "lookback_duration": "30d",   # 回溯时长 (单位: d=天, h=小时, M=月)
+    "pred_len_duration": "10d",   # 预测时长 (单位: d=天, h=小时, M=月)
+
+    # --- 模型高级参数 (通常无需修改) ---
+    "T": 1.0,                   # 采样温度 (越高越多变，越低越保守)
+    "top_p": 0.9,               # 核采样概率
+    "sample_count": 1,          # 预测路径数量
+    # --- 新增: 是否强制刷新 ---
+    "force_refetch": False,     # 设置为 True 可忽略本地缓存，强制从网络获取最新数据
+}
+# ==============================================================================
+
+class UnifiedPredictor:
+    def __init__(self):
+        self.fetcher = StockDataFetcher()
+
+    def _calculate_steps(self, duration_str, period):
+        """
+        根据时间周期字符串和数据频率计算所需的步数(数据点数量)。
+        """
+        if not isinstance(duration_str, str):
+            print(f"❌ 错误: 时间周期 '{duration_str}' 必须是字符串。")
+            return None
+
+        duration_str = duration_str.lower().strip()
+        match = re.match(r"(\d+)([dhm])", duration_str)
+
+        if not match:
+            print(f"❌ 错误: 无法解析时间周期字符串 '{duration_str}'。请使用如 '30d', '4h', '1M' 的格式。")
+            return None
+
+        value, unit = int(match.group(1)), match.group(2)
+
+        # --- 基于数据频率(period)进行计算 ---
+        if period == 'D': # 日线数据
+            if unit == 'd':
+                return value
+            elif unit == 'm':
+                return value * 21  # 假设每月21个交易日
+            else: # 'h'
+                print(f"⚠️ 警告: 日线数据频率不支持按小时('{duration_str}')计算，将按天处理。")
+                return value
+        
+        else: # 分钟数据
+            try:
+                minutes_per_step = int(period)
+                # 假设A股每天交易4小时 = 240分钟
+                steps_per_day = 240 // minutes_per_step
+                
+                if unit == 'd':
+                    return value * steps_per_day
+                elif unit == 'm':
+                    return value * 21 * steps_per_day # 按每月21个交易日计算
+                elif unit == 'h':
+                    return value * (60 // minutes_per_step)
+
+            except (ValueError, ZeroDivisionError):
+                print(f"❌ 错误: 无效的分钟线周期 '{period}'。")
+                return None
+
+    def run_prediction(self, config):
+        """
+        根据配置运行完整的获取数据和预测流程。
+        """
+        print("🚀 开始执行股票预测流程...")
+        print("="*60)
+        print(f"🎯 目标股票: {config['symbol']} ({config['source']})")
+        print("="*60)
+
+        # === 新增: 智能计算回溯和预测步数 ===
+        print("🧠 正在智能计算回溯和预测步数...")
+        lookback_steps = self._calculate_steps(config['lookback_duration'], config['period'])
+        pred_len_steps = self._calculate_steps(config['pred_len_duration'], config['period'])
+        
+        if lookback_steps is None or pred_len_steps is None:
+            print("❌ 无法解析时间周期字符串，流程终止。")
+            return
+            
+        print(f"   - 数据频率: {config['period']}")
+        print(f"   - 回溯时长 '{config['lookback_duration']}' -> 计算为 {lookback_steps} 个数据点")
+        print(f"   - 预测时长 '{config['pred_len_duration']}' -> 计算为 {pred_len_steps} 个数据点")
+        print("="*60)
+
+        # === 步骤 1: 获取数据 ===
+        print("📊 正在获取数据...")
+        
+        # 将'period'转换为'akshare'和'yfinance'能理解的格式
+        period_map = {'5': '5m', '15': '15m', '30': '30m', '60': '60m', 'D': '1d'}
+        fetch_period = config['period']
+        if config['source'] == 'yfinance':
+            fetch_period = period_map.get(config['period'], '1d')
+
+        df, filepath, metadata = self.fetcher.get_stock_data(
+            symbol=config['symbol'],
+            source=config['source'],
+            start_date=config['start_date'],
+            end_date=config['end_date'],
+            period=fetch_period,
+            save=True
+        )
+
+        if filepath is None:
+            print("❌ 获取数据失败，流程终止。")
+            return
+
+        print(f"✅ 数据获取成功，已保存/加载于: {filepath}")
+        print("="*60)
+
+        # === 新增：智能数据裁剪 ===
+        print("="*60)
+        print("✂️ 正在根据数据量智能裁剪...")
+        original_rows = len(df)
+        print(f"   - 用于分析的原始数据共有 {original_rows} 条。")
+
+        if original_rows > 5000:
+            max_rows = 10000
+            # 截取最新的数据
+            df = df.tail(max_rows).reset_index(drop=True)
+            print(f"   - 数据量大于 5000，已截取最新的 {len(df)} 条数据用于后续处理。")
+        else:
+            print(f"   - 数据量小于或等于 5000，将使用全部数据。")
+ 
+        # === 步骤 2: 准备预测 ===
+        print("🤖 正在准备预测...")
+
+        if config.get("forecast_future", False):
+            # --- 未来预测模式 ---
+            print("   - 模式: 未来预测")
+            # 预测的输入数据是所有我们能获取到的历史数据
+            x_df = df[['open', 'high', 'low', 'close', 'volume', 'amount']]
+            x_timestamp = df['timestamps']
+            # 生成未来的时间戳
+            y_timestamp = self._generate_future_timestamps(df['timestamps'].iloc[-1], pred_len_steps, config['period'])
+            if y_timestamp is None:
+                print("❌ 生成未来时间戳失败，流程终止。")
+                return
+            print(f"   - 已生成 {len(y_timestamp)} 个未来时间点用于预测。")
+        else:
+            # --- 回测模式 ---
+            print("   - 模式: 回测 (与历史数据对比)")
+            # 从历史数据中切分出输入和用于对比的真实标签
+            if len(df) < lookback_steps + pred_len_steps:
+                print(f"❌ 错误: 数据不足以进行回测。所需数据点: {lookback_steps + pred_len_steps}, 实际拥有: {len(df)}")
+                return
+            
+            x_df = df.loc[:lookback_steps-1, ['open', 'high', 'low', 'close', 'volume', 'amount']]
+            x_timestamp = df.loc[:lookback_steps-1, 'timestamps']
+            y_timestamp = df.loc[lookback_steps:lookback_steps+pred_len_steps-1, 'timestamps']
+
+        predictor = StockPredictor()
+        
+        results = predictor.run_prediction_pipeline(
+            historical_df=df, # 传入完整的历史数据
+            x_df=x_df,
+            x_timestamp=x_timestamp,
+            y_timestamp=y_timestamp,
+            is_future_forecast=config.get("forecast_future", False),
+            symbol=config['symbol'],
+            pred_len=pred_len_steps,
+            T=config['T'],
+            top_p=config['top_p'],
+            sample_count=config['sample_count']
+        )
+    
+        if results is None:
+            print("❌ 预测失败，流程终止。")
+            return
+    
+        print("="*60)
+        print("🎉 预测流程全部完成！")
+        print(f"📈 预测图表已保存至: {results['files']['plot_path']}")
+        print(f"📄 预测数据已保存至: {results['files']['csv_path']}")
+        print("="*60)
+
+    def _generate_future_timestamps(self, last_timestamp, steps, period):
+        """
+        生成未来的交易时间戳 (重写以修复bug)。
+        """
+        from pandas.tseries.offsets import BDay
+        
+        timestamps = []
+        current_time = pd.to_datetime(last_timestamp)
+        
+        if period == 'D':
+            future_days = pd.date_range(start=current_time + BDay(), periods=steps, freq=BDay())
+            return future_days
+
+        try:
+            minutes_per_step = int(period)
+        except ValueError:
+            print(f"❌ 错误: 无法将周期 '{period}' 转换为分钟数。")
+            return None
+
+        while len(timestamps) < steps:
+            # 1. 时间递增
+            current_time += timedelta(minutes=minutes_per_step)
+
+            # 2. 检查是否需要跳到下一天
+            # 如果当前时间超过下午3点，或者进入了新的一天
+            if current_time.time() > datetime.strptime("15:00", "%H:%M").time() or \
+               current_time.date() > (timestamps[-1].date() if timestamps else last_timestamp.date()):
+                
+                # 计算下一个交易日
+                next_day = pd.to_datetime(current_time.date())
+                if current_time.weekday() >= 4 or current_time.time() > datetime.strptime("15:00", "%H:%M").time(): # 周五或周末，或当天收盘后
+                    next_day = next_day + BDay()
+                
+                # 重置到下一个交易日的开盘时间
+                current_time = next_day.replace(hour=9, minute=30, second=0, microsecond=0)
+
+            # 3. 处理午休 (11:30 -> 13:00)
+            if datetime.strptime("11:30", "%H:%M").time() < current_time.time() < datetime.strptime("13:00", "%H:%M").time():
+                current_time = current_time.replace(hour=13, minute=0, second=0, microsecond=0)
+
+            # 4. 检查是否在交易时间内
+            time_of_day = current_time.time()
+            is_morning = datetime.strptime("09:30", "%H:%M").time() <= time_of_day <= datetime.strptime("11:30", "%H:%M").time()
+            is_afternoon = datetime.strptime("13:00", "%H:%M").time() <= time_of_day <= datetime.strptime("15:00", "%H:%M").time()
+
+            if is_morning or is_afternoon:
+                timestamps.append(current_time)
+        
+        return pd.to_datetime(timestamps)
+
+if __name__ == "__main__":
+    # 为了演示，我们创建一个新的配置来进行未来预测
+    FUTURE_PREDICTION_CONFIG = PREDICTION_CONFIG.copy()
+    FUTURE_PREDICTION_CONFIG["forecast_future"] = True
+    FUTURE_PREDICTION_CONFIG["end_date"] = datetime.now().strftime('%Y-%m-%d') # 获取到今天为止的数据
+    
+    print("================== 模式 1: 回测历史数据 ==================")
+    UnifiedPredictor().run_prediction(PREDICTION_CONFIG)
+    
+    print("\n\n================== 模式 2: 预测未来趋势 ==================")
+    UnifiedPredictor().run_prediction(FUTURE_PREDICTION_CONFIG)

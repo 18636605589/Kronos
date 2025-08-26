@@ -1,7 +1,13 @@
 import pandas as pd
 import matplotlib.pyplot as plt
 import sys
-sys.path.append("../")
+import os
+
+# 添加项目根目录到Python路径
+current_dir = os.path.dirname(os.path.abspath(__file__))
+project_root = os.path.dirname(current_dir)
+sys.path.insert(0, project_root)
+
 from model import Kronos, KronosTokenizer, KronosPredictor
 
 
@@ -43,10 +49,10 @@ tokenizer = KronosTokenizer.from_pretrained("NeoQuasar/Kronos-Tokenizer-base")
 model = Kronos.from_pretrained("NeoQuasar/Kronos-small")
 
 # 2. Instantiate Predictor
-predictor = KronosPredictor(model, tokenizer, device="cuda:0", max_context=512)
+predictor = KronosPredictor(model, tokenizer, device="cpu", max_context=512)
 
 # 3. Prepare Data
-df = pd.read_csv("./data/XSHG_5min_600977.csv")
+df = pd.read_csv(os.path.join(current_dir, "data", "XSHG_5min_600977.csv"))
 df['timestamps'] = pd.to_datetime(df['timestamps'])
 
 lookback = 400
