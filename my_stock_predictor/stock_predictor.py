@@ -11,7 +11,9 @@ import matplotlib.pyplot as plt
 import os
 import sys
 import json
+import argparse
 from datetime import datetime, timedelta
+import torch
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -29,16 +31,17 @@ except ImportError:
 class StockPredictor:
     """股票预测器"""
     
-    def __init__(self, device="cpu", max_context=512, results_dir="my_stock_predictor/prediction_results"):
+    def __init__(self, device="auto", max_context=512, results_dir="my_stock_predictor/prediction_results"):
         """
         初始化预测器
         
         Args:
-            device (str): 计算设备，'cpu' 或 'cuda:0'
+            device (str): 计算设备，可为 'cpu'、'cuda:0' 或 'auto'
             max_context (int): 最大上下文长度
             results_dir (str): 结果保存目录
         """
-        self.device = device
+        self.requested_device = device
+        self.device = self._resolve_device(device)
         self.max_context = max_context
         self.results_dir = results_dir
         self.model = None
@@ -57,27 +60,67 @@ class StockPredictor:
             os.makedirs(self.results_dir)
             print(f"创建结果目录: {self.results_dir}")
     
+    def _resolve_device(self, device):
+        """根据当前环境解析实际使用的设备"""
+        normalized = (device or "auto").lower()
+
+        if normalized == "auto":
+            if torch.backends.mps.is_available() and torch.backends.mps.is_built():
+                print("✅ 检测到 Apple Silicon MPS，自动使用 'mps' 设备。")
+                return "mps"
+            elif torch.cuda.is_available():
+                print("✅ 检测到可用的 CUDA，自动使用 'cuda:0' 设备。")
+                return "cuda:0"
+            else:
+                print("ℹ️ 未检测到 GPU 加速，将使用 CPU。")
+                return "cpu"
+
+        if normalized.startswith("cuda"):
+            if torch.cuda.is_available():
+                return device
+            print("⚠️ 请求使用 CUDA，但当前环境不支持，已自动回退到 CPU。")
+            return "cpu"
+
+        if normalized == "mps":
+            if torch.backends.mps.is_available() and torch.backends.mps.is_built():
+                return "mps"
+            print("⚠️ 请求使用 MPS (Apple Silicon)，但当前环境不支持，已自动回退到 CPU。")
+            return "cpu"
+
+        return device
+    
     def load_model(self):
         """加载Kronos模型"""
         try:
-            print("正在加载Kronos模型...")
-            
+            print(f"正在加载Kronos模型... (device: {self.device})")
+
+            # 设置环境变量解决SSL问题
+            import os
+            os.environ['HF_HUB_DISABLE_SSL_VERIFICATION'] = '1'
+            os.environ['REQUESTS_CA_BUNDLE'] = ''
+            os.environ['SSL_CERT_FILE'] = ''
+
             # 加载分词器和模型
             self.tokenizer = KronosTokenizer.from_pretrained("NeoQuasar/Kronos-Tokenizer-base")
             self.model = Kronos.from_pretrained("NeoQuasar/Kronos-small")
-            
+
             # 创建预测器
             self.predictor = KronosPredictor(
-                self.model, 
-                self.tokenizer, 
-                device=self.device, 
+                self.model,
+                self.tokenizer,
+                device=self.device,
                 max_context=self.max_context
             )
-            
+
             print("模型加载成功！")
-            
+
         except Exception as e:
             print(f"模型加载失败: {e}")
+            print("\n🔧 解决方案:")
+            print("  1. 检查网络连接是否正常")
+            print("  2. 尝试使用代理: export HTTPS_PROXY=http://your-proxy:port")
+            print("  3. 或者下载模型到本地后设置 local_files_only=True")
+            print("  4. 如果是SSL问题，可以尝试: pip install --upgrade requests urllib3")
             raise
     
     def load_data(self, filepath):
@@ -145,7 +188,7 @@ class StockPredictor:
             print(f"数据加载失败: {e}")
             return None
     
-    def prepare_prediction_data(self, df, lookback=400, pred_len=120):
+    def prepare_prediction_data(self, df, lookback=1500, pred_len=96):
         """
         准备预测数据
         
@@ -207,7 +250,7 @@ class StockPredictor:
             print(f"预测失败: {e}")
             return None
     
-    def plot_prediction(self, historical_df, pred_df, symbol, is_future_forecast=False, save_plot=True):
+    def plot_prediction(self, historical_df, pred_df, symbol, is_future_forecast=False, save_plot=True, plot_lookback=1500):
         """
         绘制预测结果
         """
@@ -218,7 +261,7 @@ class StockPredictor:
             
             # 准备绘图数据
             start_pred_time = pred_df.index.min()
-            historical_plot_df = historical_df[historical_df['timestamps'] < start_pred_time].tail(400)
+            historical_plot_df = historical_df[historical_df['timestamps'] < start_pred_time].tail(plot_lookback)
             
             fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(15, 8), sharex=True)
             
@@ -416,9 +459,9 @@ class StockPredictor:
             print(f"分析预测结果失败: {e}")
             return None
     
-    def run_prediction_pipeline(self, historical_df, x_df, x_timestamp, y_timestamp, 
+    def run_prediction_pipeline(self, historical_df, x_df, x_timestamp, y_timestamp,
                                is_future_forecast, symbol, pred_len,
-                               T=1.0, top_p=0.9, sample_count=1):
+                               T=1.0, top_p=0.9, sample_count=1, plot_lookback=1500):
         """
         运行完整的预测流程
         """
@@ -443,7 +486,7 @@ class StockPredictor:
         analysis = self.analyze_prediction(historical_df, pred_df, symbol, is_future_forecast)
         
         # 4. 绘制图表
-        plot_path = self.plot_prediction(historical_df, pred_df, symbol, is_future_forecast)
+        plot_path = self.plot_prediction(historical_df, pred_df, symbol, is_future_forecast, plot_lookback=plot_lookback)
         
         # 5. 保存结果
         metadata = {
@@ -475,50 +518,185 @@ class StockPredictor:
         print(f"✅ {symbol} 预测流程完成！")
         return results
 
+def parse_arguments():
+    """解析命令行参数"""
+    parser = argparse.ArgumentParser(
+        description="Kronos 股票预测器 - 独立运行版本",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+使用示例:
+  python stock_predictor.py                                    # 使用默认设置运行示例
+  python stock_predictor.py --device cpu                      # 使用 CPU 运行
+  python stock_predictor.py --device cuda:0                   # 使用 GPU 运行
+  python stock_predictor.py --data-path /path/to/data.csv --symbol 000001  # 使用自定义数据
+
+参数说明:
+  device: 计算设备选择
+    - auto: 自动检测 (默认，推荐)
+    - cpu: 使用 CPU
+    - cuda:0: 使用第一个 CUDA GPU
+    - mps: 使用 Apple Silicon GPU
+
+  data-path: 自定义数据文件路径 (可选)
+    如果不指定，将使用项目中的示例数据
+
+  symbol: 股票代码 (可选)
+    与 data-path 配合使用，默认 '600977'
+        """
+    )
+
+    parser.add_argument(
+        "--device", "-d",
+        default="auto",
+        choices=["auto", "cpu", "cuda", "cuda:0", "mps"],
+        help="计算设备 (默认: auto)"
+    )
+
+    parser.add_argument(
+        "--data-path",
+        help="自定义数据文件路径 (CSV格式，包含OHLCV数据)"
+    )
+
+    parser.add_argument(
+        "--symbol", "-s",
+        default="600977",
+        help="股票代码 (默认: 600977)"
+    )
+
+    parser.add_argument(
+        "--lookback", "-l",
+        type=int,
+        default=1500,
+        help="历史数据点数量 (默认: 1500)"
+    )
+
+    parser.add_argument(
+        "--pred-len", "-p",
+        type=int,
+        default=96,
+        help="预测数据点数量 (默认: 96)"
+    )
+
+    parser.add_argument(
+        "--future-forecast",
+        action="store_true",
+        help="未来预测模式 (默认: False，回测模式)"
+    )
+
+    return parser.parse_args()
+
 def main():
-    """主函数示例"""
-    # 创建预测器
-    predictor = StockPredictor(device="cpu")
-    
-    # 示例：使用示例数据进行预测
-    print("="*60)
-    print("示例：使用Kronos示例数据进行预测")
-    print("="*60)
-    
-    # 使用项目中的示例数据
-    example_data_path = os.path.join("examples", "data", "XSHG_5min_600977.csv")
-    
-    if os.path.exists(example_data_path):
-        # 加载数据
-        df = predictor.load_data(example_data_path)
-        if df is None:
-            print("无法加载示例数据，请检查文件路径。")
-            return
+    """主函数"""
+    # 解析命令行参数
+    args = parse_arguments()
 
-        # 准备预测数据
-        lookback = 400
-        pred_len = 120
-        x_df, x_timestamp, y_timestamp = predictor.prepare_prediction_data(df, lookback, pred_len)
+    print("="*60)
+    print("🎯 Kronos 股票预测器 - 独立运行版本")
+    print("="*60)
+    print(f"📋 使用参数: device={args.device}, symbol={args.symbol}")
 
-        # 运行预测流程
-        results = predictor.run_prediction_pipeline(
-            historical_df=df, # 传入完整的df用于绘图和分析
-            x_df=x_df,
-            x_timestamp=x_timestamp,
-            y_timestamp=y_timestamp,
-            is_future_forecast=False, # 示例数据是历史数据，不是未来预测
-            symbol="600977",
-            pred_len=pred_len,
-            T=1.0,
-            top_p=0.9,
-            sample_count=1
-        )
-        
-        if results:
-            print("\n🎉 预测完成！结果已保存到prediction_results目录")
+    # 1. 创建预测器
+    try:
+        print(f"\n🚀 正在初始化预测器 (device: {args.device})...")
+        predictor = StockPredictor(device=args.device)
+        print("✅ 预测器初始化成功！")
+    except Exception as e:
+        print(f"❌ 预测器初始化失败: {e}")
+        print("\n🔧 可能的原因:")
+        print("  1. 缺少依赖包，请运行: pip install -r requirements.txt")
+        print("  2. Kronos 模型下载失败，请检查网络连接")
+        print(f"  3. 设备 '{args.device}' 不可用，尝试使用 'cpu'")
+        print("\n💡 建议:")
+        print("  python stock_predictor.py --device cpu")
+        return
+
+    # 2. 确定数据文件路径
+    if args.data_path:
+        data_path = args.data_path
+        symbol = args.symbol
+        print(f"\n📂 使用自定义数据文件: {data_path}")
+        print(f"📈 股票代码: {symbol}")
     else:
-        print(f"示例数据文件不存在: {example_data_path}")
-        print("请先运行数据获取模块获取股票数据")
+        # 使用示例数据
+        data_path = os.path.join("examples", "data", "XSHG_5min_600977.csv")
+        symbol = "600977"
+        print(f"\n📂 使用示例数据文件: {data_path}")
+        print(f"📈 股票代码: {symbol}")
+
+    if not os.path.exists(data_path):
+        print(f"❌ 数据文件不存在: {data_path}")
+        print("\n💡 建议解决方案:")
+        if args.data_path:
+            print("  1. 检查文件路径是否正确")
+            print("  2. 确保文件包含必要的列: timestamps, open, high, low, close, volume, amount")
+        else:
+            print("  1. 运行数据获取脚本获取股票数据:")
+            print("     python my_stock_predictor/run_my_prediction.py")
+        return
+
+    # 3. 加载数据
+    print(f"\n📖 正在加载数据...")
+    df = predictor.load_data(data_path)
+    if df is None:
+        print("❌ 数据加载失败")
+        return
+
+    # 4. 准备预测数据
+    lookback = args.lookback
+    pred_len = args.pred_len
+    is_future_forecast = args.future_forecast
+
+    print(f"\n⚙️ 预测参数:")
+    print(f"   - 历史数据点: {lookback}")
+    print(f"   - 预测长度: {pred_len}")
+    print(f"   - 预测模式: {'未来预测' if is_future_forecast else '历史回测'}")
+
+    # 检查数据是否足够
+    if len(df) < lookback + pred_len:
+        print(f"⚠️ 警告: 数据点不足 (需要 {lookback + pred_len}, 实际 {len(df)})")
+        # 自动调整参数
+        available_points = len(df)
+        lookback = min(lookback, available_points // 2)
+        pred_len = min(pred_len, available_points - lookback)
+        print(f"🔧 自动调整参数: lookback={lookback}, pred_len={pred_len}")
+
+    x_df, x_timestamp, y_timestamp = predictor.prepare_prediction_data(df, lookback, pred_len)
+
+    # 5. 运行预测流程
+    print("\n🔮 开始预测流程...")
+    start_time = datetime.now()
+
+    results = predictor.run_prediction_pipeline(
+        historical_df=df,
+        x_df=x_df,
+        x_timestamp=x_timestamp,
+        y_timestamp=y_timestamp,
+        is_future_forecast=is_future_forecast,
+        symbol=symbol,
+        pred_len=pred_len,
+        T=1.0,
+        top_p=0.9,
+        sample_count=1,
+        plot_lookback=lookback
+    )
+
+    end_time = datetime.now()
+    duration = (end_time - start_time).total_seconds()
+
+    if results:
+        print(f"\n🎉 预测完成！用时 {duration:.1f} 秒")
+        print(f"📁 结果已保存到 prediction_results/{symbol}/ 目录")
+        print("   - 查看生成的图表和数据文件")
+        # 打印结果概览
+        analysis = results.get('analysis', {})
+        if analysis:
+            price_change_pct = analysis.get('price_analysis', {}).get('price_change_percentage', 0)
+            trend = analysis.get('price_analysis', {}).get('trend', '未知')
+            print("\n📊 预测概览:")
+            print(f"   - 价格变化: {price_change_pct:.2f}%")
+            print(f"   - 趋势: {trend}")
+    else:
+        print(f"\n❌ 预测流程失败，用时 {duration:.1f} 秒")
 
 if __name__ == "__main__":
     main()
