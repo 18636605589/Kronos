@@ -20,6 +20,17 @@ from datetime import datetime, timedelta
 import warnings
 warnings.filterwarnings('ignore')
 
+from constants import (
+    TRADING_MINUTES_PER_DAY,
+    TRADING_DAYS_RATIO,
+    CHUNK_DAYS_MAP,
+    MAX_ATTEMPTS_MAP,
+    REQUEST_DELAY_MAP,
+    DATA_AMOUNT_CHECK_RATIO,
+    MIN_DATA_FOR_CHUNK,
+    MAX_CONSECUTIVE_EMPTY
+)
+
 class StockDataFetcher:
     """股票数据获取器"""
     
@@ -611,8 +622,8 @@ class StockDataFetcher:
             expected_rows = self._estimate_expected_rows(fallback_days, period)
             actual_rows = len(df)
 
-            # 如果实际数据量远小于预期（比如只有预期的60%或更少），尝试分段拉取
-            if actual_rows < expected_rows * 0.6:
+            # 如果实际数据量远小于预期，尝试分段拉取
+            if actual_rows < expected_rows * DATA_AMOUNT_CHECK_RATIO:
                 print(f"⚠️ 数据量不足: 实际{actual_rows}条，预期约{expected_rows}条，尝试分段拉取...")
                 print(f"   数据时间范围: {df['timestamps'].min()} 至 {df['timestamps'].max()}")
                 df = self._fetch_with_chunks(symbol, source, start_date, end_date, period, fallback_days)
@@ -626,7 +637,7 @@ class StockDataFetcher:
                 print(f"✅ 数据量正常: {actual_rows}条 (预期约{expected_rows}条)")
 
         # 额外检查：如果用户要求较长历史但数据仍然很少，强制分段拉取
-        if fallback_days is not None and fallback_days >= 90 and len(df) < 500:
+        if fallback_days is not None and fallback_days >= 90 and len(df) < MIN_DATA_FOR_CHUNK:
             print(f"强制分段拉取: 请求{fallback_days}天数据但只有{len(df)}条，尝试获取更长历史...")
             df = self._fetch_with_chunks(symbol, source, start_date, end_date, period, fallback_days)
             if df is None or df.empty:
@@ -646,14 +657,12 @@ class StockDataFetcher:
         """估算指定天数和周期的预期数据行数"""
         if period == 'D':
             # 日线数据：每个交易日1条
-            return max(days * 0.7, days * 0.5)  # 考虑周末，约70%是交易日
+            return max(int(days * TRADING_DAYS_RATIO), int(days * 0.5))
 
         try:
             minutes_per_period = int(period)
-            # 假设每天交易4小时 = 240分钟
-            trading_minutes_per_day = 240
-            rows_per_day = trading_minutes_per_day // minutes_per_period
-            expected_rows = days * rows_per_day * 0.7  # 70%交易日比例
+            rows_per_day = TRADING_MINUTES_PER_DAY // minutes_per_period
+            expected_rows = days * rows_per_day * TRADING_DAYS_RATIO
             return int(expected_rows)
         except ValueError:
             # 如果无法解析周期，返回保守估计
@@ -675,17 +684,9 @@ class StockDataFetcher:
             pd.DataFrame: 合并后的数据
         """
         # 根据数据源调整分段策略
-        if source.lower() == 'akshare':
-            # akshare 分钟线有严格限制，每段不能太长
-            chunk_days = 25  # 25天一段，避免单次请求过大
-            max_attempts = 8  # 最多尝试8段
-        elif source.lower() == 'baostock':
-            # baostock 支持更长的历史数据，可以拉取更大的段
-            chunk_days = 60  # 60天一段
-            max_attempts = 12  # 最多12段，可覆盖约2年数据
-        else:
-            chunk_days = 30
-            max_attempts = 12
+        source_lower = source.lower()
+        chunk_days = CHUNK_DAYS_MAP.get(source_lower, CHUNK_DAYS_MAP['default'])
+        max_attempts = MAX_ATTEMPTS_MAP.get(source_lower, MAX_ATTEMPTS_MAP['default'])
 
         # 计算结束日期（通常是今天）
         end_dt = datetime.now() if end_date is None else pd.to_datetime(end_date)
@@ -697,7 +698,7 @@ class StockDataFetcher:
         attempts = 0
         consecutive_empty = 0  # 连续空数据段计数
 
-        while attempts < max_attempts and consecutive_empty < 3:  # 连续3段空数据就停止
+        while attempts < max_attempts and consecutive_empty < MAX_CONSECUTIVE_EMPTY:
             # 从最近时间开始向前拉取
             current_start = current_end - timedelta(days=chunk_days - 1)
             # 确保不早于 start_date（如果指定了的话）
@@ -746,12 +747,8 @@ class StockDataFetcher:
                 break
 
             # 添加延迟避免请求过快
-            if source.lower() == 'akshare':
-                time.sleep(1.0)  # akshare 请求间隔长一些，避免限流
-            elif source.lower() == 'baostock':
-                time.sleep(0.3)  # baostock 相对稳定，延迟可以短一些
-            else:
-                time.sleep(0.5)
+            delay = REQUEST_DELAY_MAP.get(source.lower(), REQUEST_DELAY_MAP['default'])
+            time.sleep(delay)
 
         if frames:
             # 合并所有数据段

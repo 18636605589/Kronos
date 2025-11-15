@@ -1,0 +1,79 @@
+{
+  "analysis": {
+    "symbol": "300708",
+    "historical_last_close": 9.106433085876047,
+    "prediction_period_days": 144,
+    "is_future_forecast": true,
+    "price_analysis": {
+      "mean": "12.631005",
+      "std": "0.3368538",
+      "min": "9.990943",
+      "max": "13.047165",
+      "median": "12.693491",
+      "q25": 12.671351194381714,
+      "q75": 12.727996349334717,
+      "range": "3.056222",
+      "cv": "0.026668804",
+      "baseline_close": 9.106433085876047,
+      "pred_start": "9.990943",
+      "pred_end": "12.67105",
+      "price_change": 3.564616985840262,
+      "price_change_percentage": 39.14394310291407,
+      "trend": "上涨",
+      "trend_strength": "0.26825368",
+      "direction_consistency": "一致"
+    },
+    "volume_analysis": {
+      "mean": "1.1829141e+06",
+      "std": "1.3158418e+06",
+      "min": "440993.88",
+      "max": "5.5389235e+06",
+      "trend": "减少",
+      "volatility": "1.112373"
+    },
+    "risk_analysis": {
+      "pred_volatility": "0.16426207",
+      "hist_volatility": 0.005993087266813561,
+      "volatility_ratio": 27.408589920167305,
+      "var_95": "-0.0043519614",
+      "max_drawdown": -0.04866155434888119,
+      "sharpe_ratio": "0.16570373"
+    },
+    "quality_metrics": {
+      "smoothness": "0.9897585",
+      "reasonableness": 0,
+      "continuity": 1.0,
+      "overall_score": 0.6632528305053711
+    },
+    "technical_analysis": {
+      "sma_5": 12.671522903442384,
+      "sma_10": 12.673143577575683,
+      "rsi_14": 0.0
+    },
+    "timestamp": "2025-11-14T11:56:31.131451"
+  },
+  "plot_path": "/Users/zilong/Documents/项目/Python/Kronos/my_stock_predictor/prediction_results/300708/future_forecast/300708_forecast_chart_20251114_115631.png",
+  "parameters": {
+    "pred_len": 144,
+    "T": 0.3,
+    "top_p": 0.8,
+    "sample_count": 4,
+    "is_future_forecast": true
+  },
+  "data_quality": {
+    "input_points": 10000,
+    "prediction_points": 144,
+    "processing_timestamp": "2025-11-14T11:56:31.550831"
+  },
+  "symbol": "300708",
+  "prediction_time": "20251114_115631",
+  "data_points": 144,
+  "columns": [
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+    "amount"
+  ]
+}
