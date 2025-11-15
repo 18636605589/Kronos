@@ -116,6 +116,8 @@ MAX_XTICKS = 15                # 最大X轴刻度数
 DEFAULT_PLOT_LOOKBACK = 1500   # 默认绘图回溯点数
 MIN_DATA_FOR_PLOT = 5000      # 绘图所需最少数据点
 MAX_DATA_FOR_PLOT = 10000      # 绘图最多保留数据点
+DEFAULT_PLOT_LOOKBACK_DAYS = 30  # 默认图表显示天数
+FOCUS_MODE_MARGIN_DAYS = 7     # 专注模式额外边距天数
 
 # 时间轴刻度策略
 TIME_AXIS_STRATEGIES = {

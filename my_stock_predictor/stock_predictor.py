@@ -32,9 +32,23 @@ sys.path.insert(0, project_root)
 
 try:
     from model import Kronos, KronosTokenizer, KronosPredictor
-except ImportError:
-    print("错误: 无法导入Kronos模型，请确保模型文件存在")
-    sys.exit(1)
+except ImportError as e:
+    print(f"错误: 无法导入Kronos模型: {e}")
+    print("请确保model目录存在且包含必要的文件")
+    raise
+
+# 导入常量
+from constants import (
+    REQUIRED_COLUMNS,
+    TIMESTAMP_COLUMN,
+    PRICE_COLUMNS,
+    DEFAULT_SMOOTH_ALPHA,
+    OUTLIER_THRESHOLD,
+    MAX_NAN_RATIO,
+    MIN_DATA_POINTS,
+    DEFAULT_PLOT_LOOKBACK_DAYS,
+    FOCUS_MODE_MARGIN_DAYS
+)
 
 class StockPredictor:
     """股票预测器"""
@@ -131,6 +145,38 @@ class StockPredictor:
                 except ImportError:
                     pass
 
+            # 额外的内存优化措施
+            import psutil
+            import os
+
+            process = psutil.Process(os.getpid())
+            memory_info = process.memory_info()
+            memory_mb = memory_info.rss / 1024 / 1024
+
+            self.logger.info(f"当前内存使用: {memory_mb:.1f} MB")
+
+            # 如果内存使用过高，尝试释放更多资源
+            if memory_mb > 8000:  # 超过8GB
+                self.logger.warning("内存使用过高，尝试深度清理...")
+
+                # 清理可能存在的临时变量
+                if hasattr(self, 'temp_data'):
+                    delattr(self, 'temp_data')
+
+                # 再次垃圾回收
+                gc.collect()
+
+                # 在MPS上尝试更激进的清理
+                if self.device == 'mps':
+                    try:
+                        import torch
+                        # 强制同步
+                        torch.mps.synchronize()
+                        torch.mps.empty_cache()
+                        self.logger.info("已执行MPS深度清理")
+                    except:
+                        pass
+
         except Exception as e:
             self.logger.warning(f"内存优化过程中出现警告: {str(e)}")
     
@@ -144,9 +190,13 @@ class StockPredictor:
         """根据当前环境解析实际使用的设备"""
         normalized = (device or "auto").lower()
 
+        print(f"🔍 设备检测: 请求设备='{normalized}'")
+
         if normalized == "auto":
             if torch.backends.mps.is_available() and torch.backends.mps.is_built():
                 print("✅ 检测到 Apple Silicon MPS，自动使用 'mps' 设备。")
+                print("⚠️  注意: MPS可能遇到内存限制，如失败会自动切换到CPU")
+                print("💡 如需直接使用CPU，请设置: os.environ['DEVICE'] = 'cpu'")
                 return "mps"
             elif torch.cuda.is_available():
                 print("✅ 检测到可用的 CUDA，自动使用 'cuda:0' 设备。")
@@ -163,10 +213,13 @@ class StockPredictor:
 
         if normalized == "mps":
             if torch.backends.mps.is_available() and torch.backends.mps.is_built():
+                print("✅ 使用 MPS (Apple Silicon) 设备。")
+                print("💡 如果遇到内存问题，可以切换到CPU模式。")
                 return "mps"
             print("⚠️ 请求使用 MPS (Apple Silicon)，但当前环境不支持，已自动回退到 CPU。")
             return "cpu"
 
+        print(f"ℹ️ 使用指定设备: {device}")
         return device
     
     def validate_data(self, df: pd.DataFrame, context: str = "general") -> Tuple[bool, str]:
@@ -224,13 +277,19 @@ class StockPredictor:
         except Exception as e:
             return False, f"数据验证过程中发生错误: {str(e)}"
 
-    def preprocess_data(self, df: pd.DataFrame, detect_outliers: bool = True) -> pd.DataFrame:
+    def preprocess_data(self, df: pd.DataFrame, detect_outliers: bool = True,
+                       enable_advanced: bool = False, normalization: str = "none",
+                       trend_adjustment: bool = False, volatility_filter: bool = False) -> pd.DataFrame:
         """
-        数据预处理和清理
+        数据预处理和清理（增强版）
 
         Args:
             df: 原始数据框
             detect_outliers: 是否检测和处理异常值
+            enable_advanced: 是否启用高级预处理
+            normalization: 归一化方法 ('standard', 'robust', 'none')
+            trend_adjustment: 是否启用趋势调整
+            volatility_filter: 是否启用波动率过滤
 
         Returns:
             处理后的数据框
@@ -246,7 +305,7 @@ class StockPredictor:
             processed_df = df.copy()
 
             # 1. 处理缺失值
-            numeric_cols = self.data_config['required_columns']
+            numeric_cols = REQUIRED_COLUMNS
             for col in numeric_cols:
                 if processed_df[col].isnull().any():
                     # 使用前向填充，然后后向填充
@@ -261,18 +320,24 @@ class StockPredictor:
             if detect_outliers:
                 processed_df = self._handle_outliers(processed_df)
 
-            # 3. 添加数据平滑处理（优化措施）
+            # 3. 高级预处理（可选）
+            if enable_advanced:
+                processed_df = self._advanced_preprocessing(
+                    processed_df, normalization, trend_adjustment, volatility_filter
+                )
+
+            # 4. 添加数据平滑处理（优化措施）
             processed_df = self._smooth_price_data(processed_df)
 
-            # 4. 确保数据类型正确
-            processed_df[self.data_config['timestamp_column']] = pd.to_datetime(processed_df[self.data_config['timestamp_column']])
+            # 5. 确保数据类型正确
+            processed_df[TIMESTAMP_COLUMN] = pd.to_datetime(processed_df[TIMESTAMP_COLUMN])
             for col in numeric_cols:
                 processed_df[col] = pd.to_numeric(processed_df[col], errors='coerce')
 
-            # 5. 排序数据
-            processed_df = processed_df.sort_values(self.data_config['timestamp_column']).reset_index(drop=True)
+            # 6. 排序数据
+            processed_df = processed_df.sort_values(TIMESTAMP_COLUMN).reset_index(drop=True)
 
-            # 6. 最终验证处理后的数据
+            # 7. 最终验证处理后的数据
             is_valid, error_msg = self.validate_data(processed_df, "preprocessing_output")
             if not is_valid:
                 logger.warning(f"预处理后数据存在问题: {error_msg}，但继续执行")
@@ -283,6 +348,91 @@ class StockPredictor:
         except Exception as e:
             logger.error(f"数据预处理失败: {str(e)}")
             raise
+
+    def _advanced_preprocessing(self, df: pd.DataFrame, normalization: str = "none",
+                               trend_adjustment: bool = False, volatility_filter: bool = False) -> pd.DataFrame:
+        """
+        高级数据预处理方法
+
+        Args:
+            df: 输入数据框
+            normalization: 归一化方法
+            trend_adjustment: 是否趋势调整
+            volatility_filter: 是否波动率过滤
+
+        Returns:
+            处理后的数据框
+        """
+        processed_df = df.copy()
+
+        # 1. 价格归一化
+        if normalization != "none":
+            processed_df = self._normalize_prices(processed_df, method=normalization)
+
+        # 2. 趋势调整
+        if trend_adjustment:
+            processed_df = self._adjust_trend(processed_df)
+
+        # 3. 波动率过滤
+        if volatility_filter:
+            processed_df = self._filter_volatility(processed_df)
+
+        return processed_df
+
+    def _normalize_prices(self, df: pd.DataFrame, method: str = "robust") -> pd.DataFrame:
+        """价格归一化"""
+        normalized_df = df.copy()
+        price_cols = PRICE_COLUMNS
+
+        for col in price_cols:
+            if method == "standard":
+                # Z-score标准化
+                mean_val = df[col].mean()
+                std_val = df[col].std()
+                if std_val > 0:
+                    normalized_df[col] = (df[col] - mean_val) / std_val
+            elif method == "robust":
+                # 稳健标准化（使用中位数和IQR）
+                median_val = df[col].median()
+                q75, q25 = df[col].quantile([0.75, 0.25])
+                iqr = q75 - q25
+                if iqr > 0:
+                    normalized_df[col] = (df[col] - median_val) / iqr
+
+        logger.info(f"已应用{method}价格归一化")
+        return normalized_df
+
+    def _adjust_trend(self, df: pd.DataFrame) -> pd.DataFrame:
+        """趋势调整 - 去除长期趋势，突出周期性变化"""
+        adjusted_df = df.copy()
+
+        # 计算移动平均趋势
+        for col in PRICE_COLUMNS:
+            trend = df[col].rolling(window=50, center=True).mean()
+            # 去除趋势成分
+            adjusted_df[col] = df[col] - trend + trend.mean()
+
+        logger.info("已应用趋势调整")
+        return adjusted_df.fillna(method='bfill').fillna(method='ffill')
+
+    def _filter_volatility(self, df: pd.DataFrame) -> pd.DataFrame:
+        """波动率过滤 - 减少高波动期的影响"""
+        filtered_df = df.copy()
+
+        # 计算滚动波动率
+        returns = df['close'].pct_change()
+        volatility = returns.rolling(window=20).std()
+
+        # 高波动期权重降低
+        volatility_threshold = volatility.quantile(0.8)  # 80分位数
+        weights = 1 / (1 + volatility / volatility_threshold)
+
+        # 应用权重到价格数据
+        for col in PRICE_COLUMNS:
+            filtered_df[col] = df[col] * weights + df[col] * (1 - weights)
+
+        logger.info("已应用波动率过滤")
+        return filtered_df.fillna(method='bfill').fillna(method='ffill')
 
     def _smooth_price_data(self, df: pd.DataFrame) -> pd.DataFrame:
         """
@@ -338,19 +488,19 @@ class StockPredictor:
         return processed_df
     
     def load_model(self):
-        """加载Kronos模型"""
+        """加载Kronos模型，支持离线模式和自动更新"""
         try:
             print(f"正在加载Kronos模型... (device: {self.device})")
 
-            # 设置环境变量解决SSL问题
-            import os
-            os.environ['HF_HUB_DISABLE_SSL_VERIFICATION'] = '1'
-            os.environ['REQUESTS_CA_BUNDLE'] = ''
-            os.environ['SSL_CERT_FILE'] = ''
+            # 离线模式加载逻辑
+            offline_mode = os.environ.get('KRONOS_OFFLINE_MODE', 'false').lower() == 'true'
 
-            # 加载分词器和模型
-            self.tokenizer = KronosTokenizer.from_pretrained("NeoQuasar/Kronos-Tokenizer-base")
-            self.model = Kronos.from_pretrained("NeoQuasar/Kronos-base")
+            if offline_mode:
+                print("🔌 启用离线模式，只使用本地缓存的模型")
+                self._load_model_offline()
+            else:
+                print("🌐 启用在线模式，优先使用最新模型")
+                self._load_model_with_update()
 
             # 创建预测器
             self.predictor = KronosPredictor(
@@ -384,21 +534,197 @@ class StockPredictor:
             error_type = type(e).__name__
             print(f"❌ 模型加载失败 ({error_type}): {e}")
             print("\n🔧 解决方案:")
-            if "SSL" in str(e).upper():
-                print("  1. SSL证书问题，尝试: pip install --upgrade requests urllib3")
-                print("  2. 或设置环境变量跳过SSL验证: export HF_HUB_DISABLE_SSL_VERIFICATION=1")
-            elif "timeout" in str(e).lower():
-                print("  1. 网络超时，检查网络连接或使用代理")
-                print("  2. 或下载模型到本地后使用离线模式")
-            elif "disk" in str(e).lower():
-                print("  1. 磁盘空间不足，清理磁盘空间")
-                print("  2. 或设置HF_HOME到其他目录")
+
+            # 提供具体的解决方案
+            if "SSL" in str(e).upper() or "CERTIFICATE" in str(e).upper():
+                print("  1. SSL证书问题，尝试以下步骤:")
+                print("    - 升级网络库: pip install --upgrade requests urllib3 certifi")
+                print("    - 设置代理: export HTTPS_PROXY=http://your-proxy:port")
+                print("    - 或临时跳过SSL验证: export HF_HUB_DISABLE_SSL_VERIFICATION=1")
+                print("  2. 检查网络连接和防火墙设置")
+            elif "timeout" in str(e).lower() or "connection" in str(e).lower():
+                print("  1. 网络连接问题:")
+                print("    - 检查网络连接是否正常")
+                print("    - 设置代理服务器")
+                print("    - 尝试使用VPN")
+                print("  2. 下载模型到本地后离线使用")
+            elif "disk" in str(e).lower() or "space" in str(e).lower():
+                print("  1. 磁盘空间不足:")
+                print("    - 清理磁盘空间")
+                print("    - 设置HF_HOME到其他目录: export HF_HOME=/path/to/large/disk")
+            elif "memory" in str(e).lower() or "cuda" in str(e).lower():
+                print("  1. 内存不足:")
+                print("    - 使用CPU模式: export DEVICE=cpu")
+                print("    - 减少max_context参数")
+                print("    - 关闭其他程序释放内存")
             else:
-                print("  1. 检查HuggingFace token是否正确设置")
-                print("  2. 尝试重新安装transformers库")
-                print("  3. 检查是否有足够的内存和磁盘空间")
+                print("  1. 通用解决方案:")
+                print("    - 检查HuggingFace token是否正确设置")
+                print("    - 尝试重新安装相关库: pip install --upgrade transformers huggingface-hub")
+                print("    - 检查是否有足够的内存和磁盘空间")
+                print("    - 尝试重启Python环境")
+
+            # 如果是SSL错误，尝试备用方案
+            if "SSL" in str(e).upper() and "HF_HUB_DISABLE_SSL_VERIFICATION" not in os.environ:
+                print("\n🔄 尝试自动修复SSL问题...")
+                try:
+                    # 再次设置环境变量并重试
+                    os.environ['HF_HUB_DISABLE_SSL_VERIFICATION'] = '1'
+                    os.environ['REQUESTS_CA_BUNDLE'] = ''
+                    os.environ['SSL_CERT_FILE'] = ''
+                    print("✅ 已设置跳过SSL验证的环境变量，请重新运行程序")
+                except Exception as retry_e:
+                    print(f"❌ 自动修复失败: {retry_e}")
+
             raise RuntimeError(f"Kronos模型加载失败: {e}")
-    
+
+    def _load_model_offline(self):
+        """离线模式：只使用本地缓存的模型"""
+        try:
+            print("  📂 尝试加载本地缓存的Tokenizer...")
+            self.tokenizer = KronosTokenizer.from_pretrained(
+                "NeoQuasar/Kronos-Tokenizer-base",
+                local_files_only=True
+            )
+            print("  ✅ Tokenizer加载成功")
+
+            print("  🤖 尝试加载本地缓存的模型...")
+            self.model = Kronos.from_pretrained(
+                "NeoQuasar/Kronos-base",
+                local_files_only=True
+            )
+            print("  ✅ 模型加载成功")
+
+        except Exception as e:
+            print(f"❌ 离线模式加载失败: {e}")
+            print("🔧 解决方案:")
+            print("  1. 确保模型已下载到本地缓存 (~/.cache/huggingface/hub/)")
+            print("  2. 或者先运行一次在线模式下载模型")
+            print("  3. 检查网络连接和磁盘空间")
+            raise RuntimeError(f"离线模式加载失败: {e}")
+
+    def _should_update_model(self):
+        """检查是否应该更新模型"""
+        # 检查强制更新标志
+        force_update = os.environ.get('KRONOS_FORCE_UPDATE', 'false').lower() == 'true'
+        if force_update:
+            print("  🔄 检测到强制更新标志，将更新模型")
+            return True
+
+        # 检查更新间隔（默认7天）
+        update_interval_days = int(os.environ.get('KRONOS_UPDATE_INTERVAL_DAYS', '7'))
+
+        try:
+            # 检查版本跟踪文件
+            version_file = os.path.join(os.path.dirname(__file__), '.model_version.json')
+            if not os.path.exists(version_file):
+                print(f"  📝 首次运行，将下载最新模型")
+                return True
+
+            import json
+            with open(version_file, 'r') as f:
+                version_info = json.load(f)
+
+            last_update = datetime.fromisoformat(version_info.get('last_update', '2000-01-01T00:00:00'))
+            days_since_update = (datetime.now() - last_update).days
+
+            if days_since_update >= update_interval_days:
+                print(f"  ⏰ 距离上次更新已过去{days_since_update}天，将检查模型更新")
+                return True
+            else:
+                print(f"  ✅ 模型在{update_interval_days - days_since_update}天内已更新过，跳过网络检查")
+                return False
+
+        except Exception as e:
+            print(f"  ⚠️ 版本检查失败: {e}，将尝试更新")
+            return True
+
+    def _update_version_info(self):
+        """更新版本信息"""
+        try:
+            version_file = os.path.join(os.path.dirname(__file__), '.model_version.json')
+            version_info = {
+                'last_update': datetime.now().isoformat(),
+                'tokenizer_repo': 'NeoQuasar/Kronos-Tokenizer-base',
+                'model_repo': 'NeoQuasar/Kronos-base'
+            }
+            import json
+            with open(version_file, 'w') as f:
+                json.dump(version_info, f, indent=2)
+            print("  📝 已更新版本信息")
+        except Exception as e:
+            print(f"  ⚠️ 更新版本信息失败: {e}")
+
+    def _load_model_with_update(self):
+        """在线模式：智能更新模型，失败时使用本地缓存"""
+        from datetime import datetime
+
+        # 首先尝试加载本地缓存的模型（作为备用）
+        local_tokenizer = None
+        local_model = None
+        local_available = False
+
+        try:
+            print("  📂 检查本地缓存...")
+            local_tokenizer = KronosTokenizer.from_pretrained(
+                "NeoQuasar/Kronos-Tokenizer-base",
+                local_files_only=True
+            )
+            local_model = Kronos.from_pretrained(
+                "NeoQuasar/Kronos-base",
+                local_files_only=True
+            )
+            local_available = True
+            print("  ✅ 本地缓存可用")
+        except Exception as e:
+            print(f"  ⚠️ 本地缓存不可用: {e}")
+            print("  📥 将下载最新模型")
+
+        # 检查是否需要更新
+        if not self._should_update_model():
+            # 不需要更新，直接使用本地缓存
+            if local_available:
+                print("  🔄 使用本地缓存的模型...")
+                self.tokenizer = local_tokenizer
+                self.model = local_model
+                print("  ✅ 使用本地缓存版本")
+                return
+            else:
+                print("  ⚠️ 本地缓存不可用，将强制下载")
+                # 继续到网络下载流程
+
+        # 尝试从网络更新模型
+        try:
+            print("  🌐 从网络下载/更新模型...")
+
+            # 设置网络下载的环境变量（如果没有设置的话）
+            if 'HF_HUB_DISABLE_SSL_VERIFICATION' not in os.environ:
+                os.environ['HF_HUB_DISABLE_SSL_VERIFICATION'] = '1'
+                os.environ['REQUESTS_CA_BUNDLE'] = ''
+                os.environ['SSL_CERT_FILE'] = ''
+                os.environ['CURL_CA_BUNDLE'] = ''
+
+            self.tokenizer = KronosTokenizer.from_pretrained("NeoQuasar/Kronos-Tokenizer-base")
+            print("  ✅ Tokenizer加载成功")
+
+            self.model = Kronos.from_pretrained("NeoQuasar/Kronos-base")
+            print("  ✅ 模型加载成功")
+
+            # 更新版本信息
+            self._update_version_info()
+
+        except Exception as network_error:
+            print(f"  ❌ 网络加载失败: {network_error}")
+
+            if local_available:
+                print("  🔄 回退到本地缓存的模型...")
+                self.tokenizer = local_tokenizer
+                self.model = local_model
+                print("  ✅ 已切换到本地缓存版本")
+            else:
+                print("  💥 网络加载失败且无本地缓存，加载失败")
+                raise RuntimeError(f"模型加载失败: 网络错误且无本地缓存 - {network_error}")
+
     def load_data(self, filepath):
         """
         加载股票数据
@@ -576,10 +902,38 @@ class StockPredictor:
 
             return pred_df
             
-        except MemoryError:
-            self.logger.error("内存不足，无法完成预测")
-            self.optimize_memory_usage()
-            return None
+        except (MemoryError, RuntimeError) as e:
+            error_msg = str(e).lower()
+            if "out of memory" in error_msg or "memory" in error_msg:
+                self.logger.error(f"检测到内存不足错误: {e}")
+                self.optimize_memory_usage()
+
+                # 如果使用MPS遇到内存不足，尝试切换到CPU
+                if self.device == 'mps':
+                    self.logger.warning("🔄 MPS内存不足，自动切换到CPU模式...")
+                    try:
+                        # 重新初始化预测器为CPU模式
+                        self.device = 'cpu'
+                        self.predictor = KronosPredictor(
+                            self.model.to('cpu'),
+                            self.tokenizer.to('cpu'),
+                            device='cpu',
+                            max_context=self.max_context
+                        )
+                        self.logger.info("✅ 已切换到CPU模式，重试预测...")
+
+                        # 递归调用自己，使用CPU模式
+                        return self.predict(x_df, x_timestamp, y_timestamp, pred_len, T, top_p, sample_count)
+
+                    except Exception as cpu_error:
+                        self.logger.error(f"❌ CPU模式也失败: {cpu_error}")
+                        return None
+                else:
+                    self.logger.error("❌ 当前已是CPU模式，内存仍然不足")
+                    return None
+            else:
+                # 不是内存错误，重新抛出
+                raise e
         except Exception as e:
             self.performance_stats['errors_count'] += 1
             self.logger.error(f"预测失败: {str(e)}")
@@ -769,7 +1123,9 @@ class StockPredictor:
 
         return all_ticks, tick_labels
     
-    def plot_prediction(self, historical_df, pred_df, symbol, is_future_forecast=False, save_plot=True, plot_lookback=1500):
+    def plot_prediction(self, historical_df, pred_df, symbol, is_future_forecast=False, save_plot=True,
+                       plot_lookback=1500, enable_focus_mode=False, plot_lookback_days=None, prediction_highlight=True,
+                       raw_historical_df=None):
         """
         绘制预测结果 - 智能时间轴显示，区分预测和回测模式
         """
@@ -813,7 +1169,19 @@ class StockPredictor:
             try:
                 hist_timestamps = pd.to_datetime(historical_df['timestamps'])
                 pred_start = pd.to_datetime(start_pred_time)
-                historical_plot_df = historical_df[hist_timestamps < pred_start].tail(plot_lookback)
+
+                if enable_focus_mode and plot_lookback_days:
+                    # 专注模式：只显示预测相关的最近几天数据
+                    focus_end = pred_df.index.max() + pd.Timedelta(days=FOCUS_MODE_MARGIN_DAYS)
+                    focus_start = focus_end - pd.Timedelta(days=plot_lookback_days)
+                    historical_plot_df = historical_df[
+                        (hist_timestamps >= focus_start) & (hist_timestamps <= focus_end)
+                    ]
+                    logger.info(f"专注模式: 显示最近{plot_lookback_days}天的历史数据")
+                else:
+                    # 传统模式：显示指定数量的历史数据点
+                    historical_plot_df = historical_df[hist_timestamps < pred_start].tail(plot_lookback)
+
                 logger.info(f"历史数据点数: {len(historical_plot_df)}")
             except Exception as e:
                 logger.error(f"时间戳处理失败: {e}")
@@ -833,8 +1201,34 @@ class StockPredictor:
             logger.info("matplotlib图形创建完成")
             
             # --- 价格图 ---
-            ax1.plot(historical_plot_df['timestamps'], historical_plot_df['close'], label='历史价格', color='blue', linewidth=1.5)
-            ax1.plot(pred_df.index, pred_df['close'], label='预测价格', color='red', linewidth=2, linestyle='--')
+            # 使用原始历史数据（如果提供）来确保正确的价格尺度显示
+            plot_hist_df = historical_plot_df
+            if raw_historical_df is not None and not raw_historical_df.empty:
+                # 尝试匹配时间戳来获取原始数据
+                try:
+                    # 根据时间戳匹配原始历史数据
+                    hist_timestamps = historical_plot_df['timestamps']
+                    raw_plot_df = raw_historical_df[raw_historical_df['timestamps'].isin(hist_timestamps)]
+                    if not raw_plot_df.empty:
+                        plot_hist_df = raw_plot_df.copy()
+                        logger.info("使用原始历史数据进行图表绘制，确保价格尺度正确")
+                except Exception as e:
+                    logger.warning(f"无法使用原始数据绘图，使用预处理数据: {e}")
+
+            ax1.plot(plot_hist_df['timestamps'], plot_hist_df['close'], label='历史价格', color='blue', linewidth=1.5)
+
+            # 预测价格线条（支持高亮）
+            if prediction_highlight:
+                # 高亮预测区域
+                pred_start_time = pred_df.index.min()
+                pred_end_time = pred_df.index.max()
+                ax1.axvspan(pred_start_time, pred_end_time, alpha=0.1, color='red', label='预测区域')
+
+                # 绘制预测线（更粗，更明显的样式）
+                ax1.plot(pred_df.index, pred_df['close'], label='预测价格',
+                        color='red', linewidth=3, linestyle='--', marker='o', markersize=4, alpha=0.9)
+            else:
+                ax1.plot(pred_df.index, pred_df['close'], label='预测价格', color='red', linewidth=2, linestyle='--')
             
             # 在回测模式下，添加真实价格曲线
             if not is_future_forecast:
@@ -866,6 +1260,22 @@ class StockPredictor:
                         ha='center', va='bottom', fontsize=9,
                         bbox=dict(boxstyle='round,pad=0.2', facecolor='gray', alpha=0.6))
             
+            # 自动调整Y轴范围，确保价格显示清晰
+            all_prices = pd.concat([
+                plot_hist_df['close'],
+                pred_df['close']
+            ])
+            if not is_future_forecast:
+                true_prices = historical_df[historical_df['timestamps'].isin(pred_df.index)]['close']
+                all_prices = pd.concat([all_prices, true_prices])
+
+            price_min, price_max = all_prices.min(), all_prices.max()
+            price_range = price_max - price_min
+            if price_range > 0:
+                # 添加10%的边距
+                margin = price_range * 0.1
+                ax1.set_ylim(price_min - margin, price_max + margin)
+
             ax1.set_ylabel('价格', fontsize=14)
             mode_name = '未来预测' if is_future_forecast else '历史回测'
             mode_color = 'orange' if is_future_forecast else 'blue'
@@ -883,7 +1293,7 @@ class StockPredictor:
             ax1.grid(True, alpha=0.3)
             
             # --- 成交量图 ---
-            ax2.plot(historical_plot_df['timestamps'], historical_plot_df['volume'], label='历史成交量', color='blue', linewidth=1.5)
+            ax2.plot(plot_hist_df['timestamps'], plot_hist_df['volume'], label='历史成交量', color='blue', linewidth=1.5)
             ax2.plot(pred_df.index, pred_df['volume'], label='预测成交量', color='red', linewidth=2, linestyle='--')
             
             if not is_future_forecast:
@@ -1274,9 +1684,14 @@ class StockPredictor:
     
     def run_prediction_pipeline(self, historical_df, x_df, x_timestamp, y_timestamp,
                                is_future_forecast, symbol, pred_len,
-                               T=1.0, top_p=0.9, sample_count=1, plot_lookback=1500):
+                               T=1.0, top_p=0.9, sample_count=1, plot_lookback=1500,
+                               enable_advanced_preprocessing=False, price_normalization="none",
+                               trend_adjustment=False, volatility_filter=False, config=None):
         """
         运行完整的预测流程
+
+        Args:
+            config: 配置字典，包含图表显示等设置
         """
         mode_name = "未来预测" if is_future_forecast else "历史回测"
         logger.info(f"🚀 开始 {symbol} 的{mode_name}流程...")
@@ -1300,8 +1715,20 @@ class StockPredictor:
                 return None
 
             # 预处理历史数据
-            historical_df = self.preprocess_data(historical_df)
-            x_df = self.preprocess_data(input_df)[self.data_config['required_columns']]
+            historical_df = self.preprocess_data(
+                historical_df,
+                enable_advanced=enable_advanced_preprocessing,
+                normalization=price_normalization,
+                trend_adjustment=trend_adjustment,
+                volatility_filter=volatility_filter
+            )
+            x_df = self.preprocess_data(
+                input_df,
+                enable_advanced=enable_advanced_preprocessing,
+                normalization=price_normalization,
+                trend_adjustment=trend_adjustment,
+                volatility_filter=volatility_filter
+            )[REQUIRED_COLUMNS]
 
             # 确保 y_timestamp 是正确的类型
             y_timestamp_series = pd.Series(pd.to_datetime(y_timestamp))
@@ -1325,7 +1752,14 @@ class StockPredictor:
 
             # === 4. 绘制图表 ===
             logger.info("📊 生成可视化图表...")
-            plot_path = self.plot_prediction(historical_df, pred_df, symbol, is_future_forecast, plot_lookback=plot_lookback)
+            plot_path = self.plot_prediction(
+                historical_df, pred_df, symbol, is_future_forecast,
+                plot_lookback=plot_lookback,
+                enable_focus_mode=config.get('enable_focus_mode', False) if config else False,
+                plot_lookback_days=config.get('plot_lookback_days') if config else None,
+                prediction_highlight=config.get('prediction_highlight', True) if config else True,
+                raw_historical_df=historical_df  # 传入原始历史数据用于正确显示价格尺度
+            )
             if plot_path is None:
                 logger.error("❌ 图表生成失败，plot_path为None")
             else:

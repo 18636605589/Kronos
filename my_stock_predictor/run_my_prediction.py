@@ -38,6 +38,25 @@ from constants import (
 # ==============================================================================
 # === 预测配置 ===
 # ==============================================================================
+# 设备配置 - 根据你的硬件情况选择
+import os
+# 设置设备选择:
+# 'auto' = 自动检测 (推荐)
+# 'cpu' = 强制使用CPU (稳定但较慢)
+# 'cuda' = NVIDIA GPU
+# 'mps' = Apple Silicon GPU (如果遇到MPS内存问题，改用'cpu')
+# os.environ['DEVICE'] = 'cpu'  # 你有32GB内存，CPU模式应该没问题
+
+# 设备选择配置
+# 选项1: 自动检测 (推荐，优先使用MPS，内存不足时自动切换CPU)
+os.environ['DEVICE'] = 'auto'
+
+# 选项2: 直接使用CPU (稳定但较慢，适合大内存使用场景)
+# os.environ['DEVICE'] = 'cpu'
+
+# 选项3: 强制使用MPS (仅在确认MPS内存充足时使用)
+# os.environ['DEVICE'] = 'mps'
+
 PREDICTION_CONFIG = {
     # --- 股票信息 ---
     "symbol": "300708",          # 股票代码 (例如: A股 '600519', 美股 'NVDA')
@@ -49,19 +68,31 @@ PREDICTION_CONFIG = {
     "period": "5",              # 数据频率 ('5', '15', '30', '60' for 分钟, 'D' for 日线)
 
     # --- 预测参数 (使用带有单位的时间字符串) ---
-    "lookback_duration": "200d",   # 回溯时长 (单位: d=天, h=小时, M=月) - 根据实际数据量调整为200天
+    "lookback_duration": "220d",   # 回溯时长 (单位: d=天, h=小时, M=月) - 根据实际数据量调整为200天
     "pred_len_duration": "3d",    # 预测时长 (单位: d=天, h=小时, M=月) - 缩短到3天提高精度
 
-    # --- 模型高级参数 (超高精度配置) ---
-    "T": 0.3,                  # 采样温度 (极低，使预测更保守稳定)
-    "top_p": 0.8,              # 核采样概率 (极低，减少随机性)
-    "sample_count": 4,          # 预测路径数量 (单次预测，减少变异性)
+    # --- 模型高级参数 (MPS优化配置) ---
+    "T": 0.1,                  # 采样温度 (更保守，提高准确性)
+    "top_p": 0.3,              # 核采样概率 (更严格，专注高质量预测)
+    "sample_count": 6,          # 预测路径数量 (MPS模式下平衡性能和内存)
     "enable_adaptive_tuning": False,  # 禁用自适应参数调优，保持用户指定的参数
+
+    # --- 数据预处理增强 ---
+    "enable_advanced_preprocessing": True,  # 启用高级数据预处理
+    "price_normalization": "none",         # 价格归一化方法: 'standard', 'robust', 'none' (设为none避免Y轴显示问题)
+    "trend_adjustment": False,             # 禁用趋势调整 (保持原始价格尺度)
+    "volatility_filter": True,             # 启用波动率过滤
+
     # --- 新增: 是否强制刷新 ---
     "force_refetch": False,     # 设置为 True 可忽略本地缓存，强制从网络获取最新数据
     # --- 数据新鲜度控制 ---
     "min_data_freshness_days": 5,   # 允许的最大数据滞后天数
     "fallback_fetch_days": 360,     # 当数据过旧时重新拉取的时间范围(天数) - 增加到250天以支持200天回溯
+
+    # --- 图表显示优化 ---
+    "plot_lookback_days": 30,        # 图表显示的历史天数 (减少拥挤)
+    "enable_focus_mode": True,       # 启用专注模式，只显示预测相关区域
+    "prediction_highlight": True,    # 高亮预测区域
 }
 # ==============================================================================
 
@@ -322,6 +353,7 @@ class UnifiedPredictor:
         # 指定结果保存目录为当前脚本所在目录下的 prediction_results
         results_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "prediction_results")
         predictor = StockPredictor(
+            device=os.environ.get('DEVICE', 'auto'),  # 使用环境变量设置的设备
             results_dir=results_dir,
             enable_adaptive_tuning=config.get('enable_adaptive_tuning', True)
         )
@@ -337,7 +369,12 @@ class UnifiedPredictor:
             T=config['T'],
             top_p=config['top_p'],
             sample_count=config['sample_count'],
-            plot_lookback=lookback_steps
+            plot_lookback=lookback_steps,
+            enable_advanced_preprocessing=config.get('enable_advanced_preprocessing', False),
+            price_normalization=config.get('price_normalization', 'none'),
+            trend_adjustment=config.get('trend_adjustment', False),
+            volatility_filter=config.get('volatility_filter', False),
+            config=config  # 传递完整配置字典用于图表设置
         )
     
         if results is None:
@@ -485,6 +522,21 @@ def parse_arguments():
         default="future",
         help="选择执行模式: future=预测未来, backtest=历史回测"
     )
+    parser.add_argument(
+        "--offline",
+        action="store_true",
+        help="启用离线模式，只使用本地缓存的模型，不尝试网络更新"
+    )
+    parser.add_argument(
+        "--online",
+        action="store_true",
+        help="启用在线模式，尝试更新模型，失败时使用本地缓存（默认行为）"
+    )
+    parser.add_argument(
+        "--force-update",
+        action="store_true",
+        help="强制更新模型，忽略更新间隔检查"
+    )
     return parser.parse_args()
 
 
@@ -508,6 +560,21 @@ if __name__ == "__main__":
         mode_label = "📊 历史回测模式"
         mode_desc = "使用历史数据验证预测准确性"
         result_folder = "backtest"
+
+    # 设置模型加载模式
+    if args.offline:
+        os.environ['KRONOS_OFFLINE_MODE'] = 'true'
+        print("🔌 启用离线模式: 只使用本地缓存的模型")
+    elif args.online or args.force_update:
+        os.environ['KRONOS_OFFLINE_MODE'] = 'false'
+        if args.force_update:
+            os.environ['KRONOS_FORCE_UPDATE'] = 'true'
+            print("🔄 启用强制更新模式: 将强制下载最新模型")
+        else:
+            print("🌐 启用在线模式: 智能检查更新，失败时使用本地缓存")
+    else:
+        # 默认在线模式
+        os.environ['KRONOS_OFFLINE_MODE'] = 'false'
 
     print("="*60)
     print(f"   {mode_label}")
