@@ -73,8 +73,8 @@ PREDICTION_CONFIG = {
 
     # --- 模型高级参数 (MPS优化配置) ---
     "T": 0.1,                  # 采样温度 (更保守，提高准确性)
-    "top_p": 0.3,              # 核采样概率 (更严格，专注高质量预测)
-    "sample_count": 6,          # 预测路径数量 (MPS模式下平衡性能和内存)
+    "top_p": 0.7,              # 核采样概率 (更严格，专注高质量预测)
+    "sample_count": 3,          # 预测路径数量 (MPS模式下平衡性能和内存)
     "enable_adaptive_tuning": False,  # 禁用自适应参数调优，保持用户指定的参数
 
     # --- 数据预处理增强 ---
@@ -325,6 +325,8 @@ class UnifiedPredictor:
         # === 步骤 2: 准备预测 ===
         print("🤖 正在准备预测...")
 
+        ground_truth = None  # 初始化ground_truth变量
+        
         if is_future_mode:
             # --- 未来预测模式 ---
             print("   - 模式: 未来预测")
@@ -340,15 +342,22 @@ class UnifiedPredictor:
         else:
             # --- 回测模式 ---
             print("   - 模式: 回测 (与历史数据对比)")
-            # 从历史数据中切分出输入和用于对比的真实标签
+            # 使用新的prepare_backtest_data方法正确切分数据
             if len(df) < required_points_total:
                 print(f"❌ 错误: 数据不足以进行回测。所需数据点: {required_points_total}, 实际拥有: {len(df)}")
                 return
 
             subset_df = df.tail(required_points_total).reset_index(drop=True)
-            x_df = subset_df.loc[:lookback_steps-1, ['open', 'high', 'low', 'close', 'volume', 'amount']]
-            x_timestamp = subset_df.loc[:lookback_steps-1, 'timestamps']
-            y_timestamp = subset_df.loc[lookback_steps:lookback_steps+pred_len_steps-1, 'timestamps']
+            # ⚠️ 这里需要先创建临时predictor来调用prepare_backtest_data方法
+            # 为了保持一致性，我们手动切分但保存ground_truth
+            x_df = subset_df.iloc[:lookback_steps][['open', 'high', 'low', 'close', 'volume', 'amount']].copy()
+            x_timestamp = subset_df.iloc[:lookback_steps]['timestamps'].copy()
+            y_timestamp = subset_df.iloc[lookback_steps:lookback_steps+pred_len_steps]['timestamps'].copy()
+            
+            # 【关键修复】保存ground truth用于后续验证
+            ground_truth = subset_df.iloc[lookback_steps:lookback_steps+pred_len_steps][['open', 'high', 'low', 'close', 'volume', 'amount']].copy()
+            ground_truth.index = y_timestamp.values
+            print(f"   - ✅ 已准备回测数据并保存真实值用于验证")
 
         # 指定结果保存目录为当前脚本所在目录下的 prediction_results
         results_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "prediction_results")
@@ -357,6 +366,8 @@ class UnifiedPredictor:
             results_dir=results_dir,
             enable_adaptive_tuning=config.get('enable_adaptive_tuning', True)
         )
+
+        print(f"✅ StockPredictor初始化完成")
         
         results = predictor.run_prediction_pipeline(
             historical_df=df, # 传入完整的历史数据
@@ -382,7 +393,7 @@ class UnifiedPredictor:
             return
 
         # === 预测结果验证 ===
-        self._validate_prediction_results(results, config)
+        self._validate_prediction_results(results, config, ground_truth)
 
         # === 明确区分预测和回测的结果输出 ===
         print("="*60)
@@ -449,16 +460,38 @@ class UnifiedPredictor:
         
         return pd.to_datetime(timestamps)
 
-    def _validate_prediction_results(self, results, config):
+    def _validate_prediction_results(self, results, config, ground_truth=None):
         """
-        验证预测结果是否在合理范围内，防止过度偏差
+        验证预测结果是否在合理范围内，区分预测和回测
+        
+        Args:
+            results: 预测结果字典
+            config: 配置字典
+            ground_truth: 真实数据(仅回测模式),  DataFrame with index as timestamps
         """
         print("="*60)
-        print("🔍 正在验证预测结果合理性...")
-
+        
         pred_df = results['prediction']
         analysis = results['analysis']
-
+        is_future_mode = config.get("forecast_future", False)
+        
+        if is_future_mode:
+            # 未来预测：验证合理性
+            print("🔍 正在验证未来预测的合理性...")
+            self._validate_reasonability(pred_df, analysis)
+        else:
+            # 回测：计算与真实值的准确性指标
+            print("🔍 正在验证回测准确性...")
+            if ground_truth is None:
+                print("   ⚠️ 警告: 回测模式但未提供真实数据，只能进行合理性验证")
+                self._validate_reasonability(pred_df, analysis)
+            else:
+                self._validate_backtest_accuracy(pred_df, ground_truth)
+        
+        print("="*60)
+    
+    def _validate_reasonability(self, pred_df, analysis):
+        """验证预测合理性（用于未来预测或缺少ground truth的情况）"""
         # 获取预测数据的统计信息
         pred_close = pred_df['close']
         pred_mean = pred_close.mean()
@@ -480,20 +513,70 @@ class UnifiedPredictor:
         max_reasonable_deviation = 30.0
 
         if deviation_percentage > max_reasonable_deviation:
-            print(f"⚠️ 警告: 预测结果偏差过大 ({deviation_percentage:.1f}%)")
+            print(f"   ⚠️ 警告: 预测结果偏差过大 ({deviation_percentage:.1f}%)")
+            print("   建议检查数据质量或调整模型参数")
         elif deviation_percentage > 15:
-            print(f"⚠️ 注意: 预测结果偏差中等 ({deviation_percentage:.1f}%)")
+            print(f"   ⚠️ 注意: 预测结果偏差中等 ({deviation_percentage:.1f}%)")
             print("   建议微调参数以获得更准确的预测")
         else:
-            print(f"✅ 预测结果在合理范围内 (偏差: {deviation_percentage:.1f}%)")
+            print(f"   ✅ 预测结果在合理范围内 (偏差: {deviation_percentage:.1f}%)")
 
         # 检查预测的波动性是否合理
         volatility_ratio = pred_std / pred_mean
         if volatility_ratio > 0.1:  # 如果波动率超过10%
-            print(f"⚠️ 注意: 预测波动较大 (波动率: {volatility_ratio:.1%})")
+            print(f"   ⚠️ 注意: 预测波动较大 (波动率: {volatility_ratio:.1%})")
             print("   可能需要降低采样参数以获得更稳定的预测")
-
-        print("="*60)
+    
+    def _validate_backtest_accuracy(self, pred_df, ground_truth):
+        """计算回测准确性指标（与真实历史数据对比）"""
+        import numpy as np
+        
+        # 确保索引对齐
+        pred_close = pred_df['close']
+        true_close = ground_truth['close']
+        
+        # 计算各种误差指标
+        # RMSE (Root Mean Squared Error) - 均方根误差
+        rmse = np.sqrt(np.mean((true_close - pred_close) ** 2))
+        
+        # MAE (Mean Absolute Error) - 平均绝对误差
+        mae = np.mean(np.abs(true_close - pred_close))
+        
+        # MAPE (Mean Absolute Percentage Error) - 平均绝对百分比误差
+        mape = np.mean(np.abs((true_close - pred_close) / true_close)) * 100
+        
+        # 方向准确率（预测涨跌方向的准确性）
+        true_direction = np.sign(true_close.diff().dropna())
+        pred_direction = np.sign(pred_close.diff().dropna())
+        direction_accuracy = np.mean(true_direction == pred_direction) * 100
+        
+        print(f"📊 回测准确性指标:")
+        print(f"   - RMSE (均方根误差): {rmse:.4f}")
+        print(f"   - MAE (平均绝对误差): {mae:.4f}")
+        print(f"   - MAPE (平均绝对百分比误差): {mape:.2f}%")
+        print(f"   - 方向准确率: {direction_accuracy:.1f}%")
+        
+        # 评估准确性等级
+        print(f"\n📈 准确性评级:")
+        if mape < 5:
+            print(f"   ✅ 优秀 (MAPE < 5%)")
+            print(f"   🎯 预测非常准确，可以信赖该模型")
+        elif mape < 10:
+            print(f"   ✅ 良好 (MAPE < 10%)")
+            print(f"   👍 预测较为准确，可以作为参考")
+        elif mape < 20:
+            print(f"   ⚠️ 一般 (MAPE < 20%)")
+            print(f"   💡 建议调整模型参数或增加训练数据")
+        else:
+            print(f"   ❌ 较差 (MAPE >= 20%)")
+            print(f"   🔧 建议重新调整模型参数或检查数据质量")
+            
+        # 额外的细节信息
+        price_range = true_close.max() - true_close.min()
+        print(f"\n📉 详细统计:")
+        print(f"   - 真实价格范围: {true_close.min():.2f} - {true_close.max():.2f} (波动: {price_range:.2f})")
+        print(f"   - 预测价格范围: {pred_close.min():.2f} - {pred_close.max():.2f}")
+        print(f"   - 相对误差 (RMSE/价格范围): {rmse/price_range*100:.2f}%")
 
     def _estimate_required_days(self, required_points, period):
         """根据周期估算需要的最少交易日数"""

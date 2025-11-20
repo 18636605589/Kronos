@@ -104,6 +104,9 @@ class StockPredictor:
             'outlier_threshold': 3.0  # 异常值检测阈值(标准差倍数)
         }
 
+        # 归一化参数存储（用于逆变换）
+        self.normalization_params = {'method': 'none', 'params': {}}
+        
         self.logger.info("StockPredictor初始化完成")
 
     def get_performance_stats(self):
@@ -380,15 +383,22 @@ class StockPredictor:
         return processed_df
 
     def _normalize_prices(self, df: pd.DataFrame, method: str = "robust") -> pd.DataFrame:
-        """价格归一化"""
+        """价格归一化 - 保存参数用于后续逆变换"""
         normalized_df = df.copy()
         price_cols = PRICE_COLUMNS
+        
+        # 初始化归一化参数存储
+        self.normalization_params = {'method': method, 'params': {}}
 
         for col in price_cols:
             if method == "standard":
                 # Z-score标准化
                 mean_val = df[col].mean()
                 std_val = df[col].std()
+                self.normalization_params['params'][col] = {
+                    'mean': float(mean_val), 
+                    'std': float(std_val)
+                }
                 if std_val > 0:
                     normalized_df[col] = (df[col] - mean_val) / std_val
             elif method == "robust":
@@ -396,10 +406,15 @@ class StockPredictor:
                 median_val = df[col].median()
                 q75, q25 = df[col].quantile([0.75, 0.25])
                 iqr = q75 - q25
+                self.normalization_params['params'][col] = {
+                    'median': float(median_val),
+                    'iqr': float(iqr)
+                }
                 if iqr > 0:
                     normalized_df[col] = (df[col] - median_val) / iqr
 
-        logger.info(f"已应用{method}价格归一化")
+        logger.info(f"已应用{method}价格归一化并保存参数")
+        logger.debug(f"归一化参数: {self.normalization_params}")
         return normalized_df
 
     def _adjust_trend(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -433,6 +448,45 @@ class StockPredictor:
 
         logger.info("已应用波动率过滤")
         return filtered_df.fillna(method='bfill').fillna(method='ffill')
+    
+    def _inverse_normalization(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        逆归一化 - 将归一化后的数据还原到原始价格尺度
+        
+        Args:
+            df: 归一化后的数据框
+            
+        Returns:
+            还原到原始尺度的数据框
+        """
+        # 如果没有进行归一化，直接返回
+        if not self.normalization_params or self.normalization_params.get('method') == 'none':
+            logger.debug("未进行归一化，跳过逆变换")
+            return df
+        
+        denormalized_df = df.copy()
+        method = self.normalization_params['method']
+        params = self.normalization_params.get('params', {})
+        
+        if not params:
+            logger.warning("归一化参数为空，无法进行逆变换")
+            return df
+        
+        # 对每个价格列进行逆变换
+        for col in PRICE_COLUMNS:
+            if col in df.columns and col in params:
+                col_params = params[col]
+                if method == "standard":
+                    # Z-score逆变换: x = z * std + mean
+                    denormalized_df[col] = df[col] * col_params['std'] + col_params['mean']
+                    logger.debug(f"列 {col} 逆标准化: mean={col_params['mean']:.4f}, std={col_params['std']:.4f}")
+                elif method == "robust":
+                    # Robust逆变换: x = z * IQR + median
+                    denormalized_df[col] = df[col] * col_params['iqr'] + col_params['median']
+                    logger.debug(f"列 {col} 逆稳健标准化: median={col_params['median']:.4f}, iqr={col_params['iqr']:.4f}")
+        
+        logger.info(f"已应用{method}逆归一化，数据还原到原始价格尺度")
+        return denormalized_df
 
     def _smooth_price_data(self, df: pd.DataFrame) -> pd.DataFrame:
         """
@@ -816,6 +870,38 @@ class StockPredictor:
         
         return x_df, x_timestamp, y_timestamp
     
+    def prepare_backtest_data(self, df, lookback=1500, pred_len=96):
+        """
+        准备回测数据 - 正确切分训练和测试集
+        
+        Args:
+            df: 完整历史数据
+            lookback: 训练数据长度
+            pred_len: 预测长度（回测长度）
+            
+        Returns:
+            tuple: (训练数据, 训练时间戳, 预测时间戳, 真实测试数据)
+        """
+        if len(df) < lookback + pred_len:
+            raise ValueError(f"数据长度({len(df)})不足以进行回测，需要至少 {lookback + pred_len} 个数据点")
+        
+        # 训练数据：前 lookback 行
+        x_df = df.iloc[:lookback][['open', 'high', 'low', 'close', 'volume', 'amount']].copy()
+        x_timestamp = df.iloc[:lookback]['timestamps'].copy()
+        
+        # 预测时间戳：接下来 pred_len 行的时间戳
+        y_timestamp = df.iloc[lookback:lookback+pred_len]['timestamps'].copy()
+        
+        # 真实数据：用于后续验证（ground truth）
+        ground_truth = df.iloc[lookback:lookback+pred_len][['open', 'high', 'low', 'close', 'volume', 'amount']].copy()
+        ground_truth.index = y_timestamp.values  # 设置索引为时间戳
+        
+        logger.info(f"回测数据准备完成: 训练集 {len(x_df)} 行, 预测集 {len(ground_truth)} 行")
+        logger.info(f"训练时间范围: {x_timestamp.iloc[0]} 至 {x_timestamp.iloc[-1]}")
+        logger.info(f"预测时间范围: {y_timestamp.iloc[0]} 至 {y_timestamp.iloc[-1]}")
+        
+        return x_df, x_timestamp, y_timestamp, ground_truth
+    
     def predict(self, x_df, x_timestamp, y_timestamp, pred_len, T=0.3, top_p=0.8, sample_count=5):
         """
         进行预测
@@ -883,6 +969,9 @@ class StockPredictor:
             if pred_df is not None:
                 # 后处理预测结果
                 pred_df = self._postprocess_predictions(pred_df, x_df)
+                
+                # 【新增】应用逆归一化，将预测结果还原到原始价格尺度
+                pred_df = self._inverse_normalization(pred_df)
 
                 # 更新性能统计
                 inference_time = time.time() - start_time
@@ -948,7 +1037,7 @@ class StockPredictor:
         """
         # 如果禁用自适应调整，直接返回原始参数
         if not enable_adaptive:
-            self.logger.info("自适应参数调优已禁用，使用用户指定的参数")
+            self.logger.info(f"自适应参数调优已禁用，使用用户指定的参数: T={T}, top_p={top_p}")
             return T, top_p, sample_count
 
         # 计算数据的波动性
