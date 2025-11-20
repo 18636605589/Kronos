@@ -38,6 +38,7 @@ except ImportError as e:
     raise
 
 # 导入常量
+from utils.technical_analysis import TechnicalAnalyzer
 from constants import (
     REQUIRED_COLUMNS,
     TIMESTAMP_COLUMN,
@@ -1591,7 +1592,7 @@ class StockPredictor:
             quality_metrics = self._evaluate_prediction_quality(historical_df, pred_df, is_future_forecast)
 
             # === 5. 技术指标分析 ===
-            technical_analysis = self._calculate_technical_indicators(pred_df)
+            technical_analysis = self._calculate_technical_indicators(pred_df, historical_df)
 
             # 整合所有分析结果
             analysis = {
@@ -1740,29 +1741,58 @@ class StockPredictor:
 
         return quality_scores
 
-    def _calculate_technical_indicators(self, pred_df):
-        """计算技术指标"""
+    def _calculate_technical_indicators(self, pred_df, historical_df=None):
+        """
+        计算技术指标
+        如果提供了historical_df，会将其与pred_df合并以计算更准确的指标（如MA20需要至少20天数据）
+        """
         indicators = {}
+        
+        # 准备计算用的数据
+        if historical_df is not None and not historical_df.empty:
+            # 取历史数据的最后一部分，确保足够计算长周期指标 (如MACD需要26+9=35天，MA60需要60天)
+            # 取100天应该足够
+            hist_subset = historical_df.tail(100)[['close']].copy()
+            pred_subset = pred_df[['close']].copy()
+            combined_df = pd.concat([hist_subset, pred_subset])
+        else:
+            combined_df = pred_df[['close']].copy()
 
-        if len(pred_df) < 14:  # 数据点太少，无法计算技术指标
+        if len(combined_df) < 5:  # 数据点太少
             return indicators
 
-        close_prices = pred_df['close']
-
-        # 简单移动平均
-        indicators['sma_5'] = close_prices.rolling(5).mean().iloc[-1] if len(close_prices) >= 5 else None
-        indicators['sma_10'] = close_prices.rolling(10).mean().iloc[-1] if len(close_prices) >= 10 else None
-
-        # RSI (简化版)
-        if len(close_prices) >= 14:
-            delta = close_prices.diff()
-            gain = (delta.where(delta > 0, 0)).rolling(14).mean()
-            loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-            rs = gain / loss
-            indicators['rsi_14'] = 100 - (100 / (1 + rs)).iloc[-1]
-        else:
-            indicators['rsi_14'] = None
-
+        try:
+            # 使用TechnicalAnalyzer计算
+            # MA
+            ma5 = TechnicalAnalyzer.calculate_ma(combined_df['close'], 5)
+            ma10 = TechnicalAnalyzer.calculate_ma(combined_df['close'], 10)
+            ma20 = TechnicalAnalyzer.calculate_ma(combined_df['close'], 20)
+            
+            # MACD
+            macd, signal, hist = TechnicalAnalyzer.calculate_macd(combined_df['close'])
+            
+            # RSI
+            rsi = TechnicalAnalyzer.calculate_rsi(combined_df['close'])
+            
+            # 获取预测部分的最后一个值
+            indicators['ma5'] = ma5.iloc[-1]
+            indicators['ma10'] = ma10.iloc[-1]
+            indicators['ma20'] = ma20.iloc[-1]
+            
+            indicators['macd'] = macd.iloc[-1]
+            indicators['macd_signal'] = signal.iloc[-1]
+            indicators['macd_hist'] = hist.iloc[-1]
+            
+            indicators['rsi'] = rsi.iloc[-1]
+            
+            # 添加趋势判断
+            indicators['trend_ma'] = 'bullish' if ma5.iloc[-1] > ma10.iloc[-1] > ma20.iloc[-1] else 'bearish'
+            indicators['trend_macd'] = 'bullish' if macd.iloc[-1] > signal.iloc[-1] else 'bearish'
+            indicators['trend_rsi'] = 'overbought' if rsi.iloc[-1] > 70 else ('oversold' if rsi.iloc[-1] < 30 else 'neutral')
+            
+        except Exception as e:
+            self.logger.warning(f"计算技术指标失败: {e}")
+            
         return indicators
 
     def _calculate_max_drawdown(self, prices):
