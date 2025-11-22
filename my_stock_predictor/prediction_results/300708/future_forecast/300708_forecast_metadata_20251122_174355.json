@@ -1,0 +1,86 @@
+{
+  "analysis": {
+    "symbol": "300708",
+    "historical_last_close": 8.31,
+    "prediction_period_days": 20,
+    "is_future_forecast": true,
+    "price_analysis": {
+      "mean": "8.965848",
+      "std": "0.054494403",
+      "min": "8.826411",
+      "max": "9.04047",
+      "median": "8.976738",
+      "q25": 8.947437286376953,
+      "q75": 9.001945972442627,
+      "range": "0.21405888",
+      "cv": "0.006077998",
+      "baseline_close": 8.31,
+      "pred_start": "8.826411",
+      "pred_end": "9.017981",
+      "price_change": 0.7079805755615229,
+      "price_change_percentage": 8.51962184791243,
+      "trend": "上涨",
+      "trend_strength": "0.021704102",
+      "direction_consistency": "一致"
+    },
+    "volume_analysis": {
+      "mean": "2.8490748e+06",
+      "std": "771693.1",
+      "min": "2.3238725e+06",
+      "max": "5.8390855e+06",
+      "trend": "减少",
+      "volatility": "0.27085745"
+    },
+    "risk_analysis": {
+      "pred_volatility": "0.030995097",
+      "hist_volatility": 0.16624236806137282,
+      "volatility_ratio": 0.18644523278136338,
+      "var_95": "-0.002379942",
+      "max_drawdown": -0.002497034863578359,
+      "sharpe_ratio": "0.5800495"
+    },
+    "quality_metrics": {
+      "smoothness": "0.9980513",
+      "reasonableness": 0,
+      "continuity": 1.0,
+      "overall_score": 0.6660170952479044
+    },
+    "technical_analysis": {
+      "ma5": 9.013799095153809,
+      "ma10": 9.005848503112793,
+      "ma20": 8.965848350524903,
+      "macd": 0.04715167489140448,
+      "macd_signal": 0.03726005839692965,
+      "macd_hist": 0.009891616494474835,
+      "rsi": 71.07234460771389,
+      "trend_ma": "bullish",
+      "trend_macd": "bullish",
+      "trend_rsi": "overbought"
+    },
+    "timestamp": "2025-11-22T17:43:55.331073"
+  },
+  "plot_path": "/Users/zilong/Documents/项目/Python/Kronos/my_stock_predictor/prediction_results/300708/future_forecast/300708_forecast_chart_20251122_174355.png",
+  "parameters": {
+    "pred_len": 20,
+    "T": 0.2,
+    "top_p": 0.8,
+    "sample_count": 5,
+    "is_future_forecast": true
+  },
+  "data_quality": {
+    "input_points": 1908,
+    "prediction_points": 20,
+    "processing_timestamp": "2025-11-22T17:43:55.671551"
+  },
+  "symbol": "300708",
+  "prediction_time": "20251122_174355",
+  "data_points": 20,
+  "columns": [
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+    "amount"
+  ]
+}

@@ -248,8 +248,13 @@ class StockPredictor:
                 return False, f"缺少时间戳列: {self.data_config['timestamp_column']}"
 
             # 3. 检查数据量是否足够
-            if len(df) < self.data_config['min_data_points']:
-                return False, f"数据点过少: {len(df)} < {self.data_config['min_data_points']}"
+            min_required = self.data_config['min_data_points']
+            if len(df) < min_required:
+                return False, f"数据点严重不足: {len(df)} < {min_required} (至少需要{min_required}个点)"
+            
+            # 软性警告：如果数据量少于推荐值但多于最小值
+            if len(df) < 500:
+                 self.logger.warning(f"数据量较少 ({len(df)}), 可能影响模型效果 (推荐 > 500)")
 
             # 4. 检查NaN值比例
             nan_ratio = df[self.data_config['required_columns']].isnull().sum().sum() / (len(df) * len(self.data_config['required_columns']))
@@ -1103,12 +1108,13 @@ class StockPredictor:
 
         return processed_df
 
-    def _calculate_smart_xticks(self, timestamps, max_ticks=15, is_future_forecast=False):
+    def _calculate_smart_xticks(self, timestamps, pred_start_time=None, max_ticks=15, is_future_forecast=False):
         """
         计算智能时间轴刻度，越接近当前时间显示越详细
 
         Args:
             timestamps: 所有时间戳
+            pred_start_time: 预测开始时间 (如果为None则自动计算)
             max_ticks: 最大刻度数量
 
         Returns:
@@ -1121,62 +1127,76 @@ class StockPredictor:
         start_time = timestamps.min()
         end_time = timestamps.max()
         total_duration = end_time - start_time
+        
+        # 确定预测开始时间
+        if pred_start_time is None:
+            # 默认取最后1/5作为预测区域估计
+            pred_start = start_time + total_duration * 0.8
+        else:
+            pred_start = pd.to_datetime(pred_start_time)
 
         # 计算关键时间点
         current_time = pd.Timestamp.now()
-        pred_start = timestamps[timestamps >= start_time].min() if len(timestamps) > 0 else end_time
 
         # 根据时间跨度确定刻度密度
         total_hours = total_duration.total_seconds() / 3600
-
+        
+        # 动态调整频率，确保至少有5个基础刻度
         if total_hours <= 24:  # 1天内
-            # 每小时一个刻度，重点区域每15分钟
-            base_freq = 'H'
-            dense_freq = '15min'
+            base_freq = 'H'      # 每小时
         elif total_hours <= 168:  # 1周内
-            # 每天一个刻度，重点区域每小时
-            base_freq = 'D'
-            dense_freq = 'H'
+            base_freq = 'D'      # 每天
         elif total_hours <= 720:  # 1月内
-            # 每周一个刻度，重点区域每天
-            base_freq = 'W'
-            dense_freq = 'D'
+            base_freq = '2D'     # 每2天
+        elif total_hours <= 2160: # 3个月内
+            base_freq = 'W'      # 每周
         else:  # 更长时间
-            # 每月一个刻度，重点区域每周
-            base_freq = 'M'
-            dense_freq = 'W'
+            base_freq = 'M'      # 每月
 
         # 生成基础刻度
         base_ticks = pd.date_range(start=start_time, end=end_time, freq=base_freq)
+        
+        # 如果基础刻度太少，强制加密
+        if len(base_ticks) < 5:
+            if total_hours <= 24: base_freq = '30min'
+            elif total_hours <= 168: base_freq = '6H'
+            elif total_hours <= 720: base_freq = '12H'
+            else: base_freq = '5D'
+            base_ticks = pd.date_range(start=start_time, end=end_time, freq=base_freq)
 
         # 在关键区域添加密集刻度
         dense_ticks = []
-
+        
         # 预测开始时间前后的密集刻度
-        pred_dense_start = pred_start - pd.Timedelta(hours=min(total_hours * 0.1, 24))
-        pred_dense_end = pred_start + pd.Timedelta(hours=min(total_hours * 0.1, 24))
+        # 关键区域范围：总时长的10%，但不超过24小时
+        focus_window_hours = min(total_hours * 0.1, 24)
+        
+        pred_dense_start = pred_start - pd.Timedelta(hours=focus_window_hours)
+        pred_dense_end = pred_start + pd.Timedelta(hours=focus_window_hours)
+        
         if pred_dense_start < end_time and pred_dense_end > start_time:
-            pred_dense = pd.date_range(
+            # 密集频率是基础频率的1/4
+            dense_ticks.extend(pd.date_range(
                 start=max(pred_dense_start, start_time),
                 end=min(pred_dense_end, end_time),
-                freq=dense_freq
-            )
-            dense_ticks.extend(pred_dense)
+                periods=5 # 强制在关键区域生成至少5个点
+            ))
 
         # 当前时间前后的密集刻度（如果是未来预测）
         if is_future_forecast and abs(current_time - end_time) < pd.Timedelta(days=30):
-            current_dense_start = current_time - pd.Timedelta(hours=min(total_hours * 0.15, 48))
-            current_dense_end = min(current_time + pd.Timedelta(hours=min(total_hours * 0.15, 48)), end_time)
+            current_dense_start = current_time - pd.Timedelta(hours=focus_window_hours)
+            current_dense_end = min(current_time + pd.Timedelta(hours=focus_window_hours), end_time)
+            
             if current_dense_start < end_time and current_dense_end > start_time:
-                current_dense = pd.date_range(
+                dense_ticks.extend(pd.date_range(
                     start=max(current_dense_start, start_time),
                     end=current_dense_end,
-                    freq=dense_freq
-                )
-                dense_ticks.extend(current_dense)
+                    periods=5
+                ))
 
         # 合并所有刻度并去重
         all_ticks = sorted(set(base_ticks).union(set(dense_ticks)))
+        # 过滤掉范围外的时间点
         all_ticks = [t for t in all_ticks if start_time <= t <= end_time]
 
         # 限制刻度数量
@@ -1186,8 +1206,15 @@ class StockPredictor:
             other_ticks = []
 
             for tick in all_ticks:
-                if (abs(tick - pred_start) < pd.Timedelta(hours=24) or
-                    (is_future_forecast and abs(tick - current_time) < pd.Timedelta(hours=24))):
+                is_key = False
+                # 检查是否在预测开始时间附近
+                if abs(tick - pred_start) < pd.Timedelta(hours=focus_window_hours):
+                    is_key = True
+                # 检查是否在当前时间附近
+                if is_future_forecast and abs(tick - current_time) < pd.Timedelta(hours=focus_window_hours):
+                    is_key = True
+                
+                if is_key:
                     key_ticks.append(tick)
                 else:
                     other_ticks.append(tick)
@@ -1199,17 +1226,24 @@ class StockPredictor:
                 sampled_other = other_ticks[::step][:remaining_slots]
                 all_ticks = sorted(set(key_ticks + sampled_other))
             else:
-                all_ticks = sorted(key_ticks)
+                # 如果关键刻度本身就很多，也进行采样
+                if len(key_ticks) > max_ticks:
+                     step = len(key_ticks) // max_ticks
+                     all_ticks = key_ticks[::step]
+                else:
+                    all_ticks = sorted(key_ticks)
 
         # 生成刻度标签
         tick_labels = []
         for tick in all_ticks:
             if total_hours <= 24:  # 1天内显示时分
-                tick_labels.append(tick.strftime('%m-%d %H:%M'))
+                tick_labels.append(tick.strftime('%H:%M'))
             elif total_hours <= 168:  # 1周内显示日期和小时
-                tick_labels.append(tick.strftime('%m-%d %H:00'))
-            else:  # 更长时间显示日期
+                tick_labels.append(tick.strftime('%m-%d %Hh'))
+            elif total_hours <= 24 * 60: # 2个月内
                 tick_labels.append(tick.strftime('%m-%d'))
+            else:  # 更长时间显示年月
+                tick_labels.append(tick.strftime('%Y-%m-%d'))
 
         return all_ticks, tick_labels
     
@@ -1406,7 +1440,12 @@ class StockPredictor:
             ax2.grid(True, alpha=0.3)
 
             # 设置智能时间轴刻度
-            smart_ticks, tick_labels = self._calculate_smart_xticks(all_timestamps, max_ticks=20, is_future_forecast=is_future_forecast)
+            smart_ticks, tick_labels = self._calculate_smart_xticks(
+                all_timestamps, 
+                pred_start_time=pred_df.index.min(),
+                max_ticks=20, 
+                is_future_forecast=is_future_forecast
+            )
             if smart_ticks:
                 ax2.set_xticks(smart_ticks)
                 ax2.set_xticklabels(tick_labels, rotation=45, ha='right', fontsize=10)
@@ -1833,6 +1872,9 @@ class StockPredictor:
                 logger.error(f"输入数据验证失败: {error_msg}")
                 return None
 
+            # 【关键修复】保存原始历史数据用于后续分析和绘图
+            original_historical_df = historical_df.copy()
+
             # 预处理历史数据
             historical_df = self.preprocess_data(
                 historical_df,
@@ -1864,7 +1906,8 @@ class StockPredictor:
 
             # === 3. 分析预测结果 ===
             logger.info("📈 分析预测结果...")
-            analysis = self.analyze_prediction(historical_df, pred_df, symbol, is_future_forecast)
+            # 【关键修复】使用原始历史数据进行分析
+            analysis = self.analyze_prediction(original_historical_df, pred_df, symbol, is_future_forecast)
             if analysis is None:
                 logger.error("预测结果分析失败")
                 return None
@@ -1872,12 +1915,12 @@ class StockPredictor:
             # === 4. 绘制图表 ===
             logger.info("📊 生成可视化图表...")
             plot_path = self.plot_prediction(
-                historical_df, pred_df, symbol, is_future_forecast,
+                original_historical_df, pred_df, symbol, is_future_forecast,
                 plot_lookback=plot_lookback,
                 enable_focus_mode=config.get('enable_focus_mode', False) if config else False,
                 plot_lookback_days=config.get('plot_lookback_days') if config else None,
                 prediction_highlight=config.get('prediction_highlight', True) if config else True,
-                raw_historical_df=historical_df  # 传入原始历史数据用于正确显示价格尺度
+                raw_historical_df=original_historical_df  # 传入原始历史数据用于正确显示价格尺度
             )
             if plot_path is None:
                 logger.error("❌ 图表生成失败，plot_path为None")

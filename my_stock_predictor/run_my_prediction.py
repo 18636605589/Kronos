@@ -60,6 +60,40 @@ os.environ['DEVICE'] = 'auto'
 # 选项3: 强制使用MPS (仅在确认MPS内存充足时使用)
 # os.environ['DEVICE'] = 'mps'
 
+"""
+超短线 / 日内交易 (当前配置)
+适合人群：盯盘时间多，喜欢抓日内波动，做 T+0 或隔日超短线。
+
+特点：反应极快，但噪音多，容易被假动作骗。
+推荐参数：
+python
+"period": "5",              # 5分钟线
+"lookback_duration": "20d", # 回溯20天 (约1000个点)
+"pred_len_duration": "1d",  # 预测未来1天 (约48个点)
+"T": 0.2,                   # 低温，求稳
+===================================================
+短线波段 (最推荐新手/上班族)
+适合人群：每天看一眼，持股 3-5 天，抓周级别的波段。
+
+特点：过滤了日内的细微噪音，信号更稳，胜率通常比5分钟线更高。
+推荐参数：
+python
+"period": "60",             # 60分钟线 (1小时)
+"lookback_duration": "60d", # 回溯60天 (约240个点，覆盖一个季度)
+"pred_len_duration": "5d",  # 预测未来5天 (约20个点，一周)
+"T": 0.7,                   # 稍微给一点灵活性
+===================================================
+适合人群：不常看盘，持股 1-3 个月，抓大趋势。
+
+特点：非常稳健，忽略短期波动，只看大方向。
+推荐参数：
+python
+"period": "D",              # 日线
+"lookback_duration": "250d",# 回溯250天 (约1年)
+"pred_len_duration": "20d", # 预测未来20天 (约1个月)
+"T": 0.4,                   # 允许模型发挥更多“想象力”来捕捉趋势
+"""
+
 PREDICTION_CONFIG = {
     # --- 股票信息 ---
     "symbol": "300708",          # 股票代码 (例如: A股 '600519', 美股 'NVDA')
@@ -68,32 +102,32 @@ PREDICTION_CONFIG = {
     # --- 数据获取时间范围 ---
     "start_date": None,         # 数据开始日期 (None 表示自动根据 fallback_fetch_days 计算)
     "end_date": None,           # 数据结束日期 (None 表示使用当前日期)
-    "period": "5",              # 数据频率 ('5', '15', '30', '60' for 分钟, 'D' for 日线)
+    "period": "60",             # 数据频率 ('5', '15', '30', '60' for 分钟, 'D' for 日线) - 切换为60分钟线
 
     # --- 预测参数 (使用带有单位的时间字符串) ---
-    "lookback_duration": "220d",   # 回溯时长 (单位: d=天, h=小时, M=月) - 根据实际数据量调整为200天
-    "pred_len_duration": "3d",    # 预测时长 (单位: d=天, h=小时, M=月) - 缩短到3天提高精度
+    "lookback_duration": "120d",   # 回溯时长 (单位: d=天, h=小时, M=月) - 120天约480个点，完美利用模型上下文(512)
+    "pred_len_duration": "5d",    # 预测时长 (单位: d=天, h=小时, M=月) - 预测未来5天 (约20个点)
 
     # --- 模型高级参数 (MPS优化配置) ---
-    "T": 0.9,                  # 采样温度 (更保守，提高准确性)
-    "top_p": 0.7,              # 核采样概率 (更严格，专注高质量预测)
-    "sample_count": 1,          # 预测路径数量 (MPS模式下平衡性能和内存)
-    "enable_adaptive_tuning": False,  # 禁用自适应参数调优，保持用户指定的参数
+    "T": 0.2,                  # 采样温度 (稍微给一点灵活性)
+    "top_p": 0.8,              # 核采样概率 (适度宽松，允许一定灵活性)
+    "sample_count": 5,          # 预测路径数量 (用户设备支持最大5，增加路径数可提高稳定性)
+    "enable_adaptive_tuning": False,  # 禁用自适应参数调优，使用我们设定的优化参数
 
     # --- 数据预处理增强 ---
     "enable_advanced_preprocessing": True,  # 启用高级数据预处理
-    "price_normalization": "none",         # 价格归一化方法: 'standard', 'robust', 'none' (设为none避免Y轴显示问题)
-    "trend_adjustment": False,             # 禁用趋势调整 (保持原始价格尺度)
+    "price_normalization": "robust",       # 价格归一化方法: 'standard', 'robust', 'none'
+    "trend_adjustment": False,             # 禁用趋势调整 (直接预测价格，避免平滑过度)
     "volatility_filter": True,             # 启用波动率过滤
 
     # --- 新增: 是否强制刷新 ---
     "force_refetch": False,     # 设置为 True 可忽略本地缓存，强制从网络获取最新数据
     # --- 数据新鲜度控制 ---
     "min_data_freshness_days": 5,   # 允许的最大数据滞后天数
-    "fallback_fetch_days": 360,     # 当数据过旧时重新拉取的时间范围(天数) - 增加到250天以支持200天回溯
-
+    "fallback_fetch_days": 150,     # 当数据过旧时重新拉取的时间范围(天数) - 调整为150天以覆盖120天回溯
+    
     # --- 图表显示优化 ---
-    "plot_lookback_days": 30,        # 图表显示的历史天数 (减少拥挤)
+    "plot_lookback_days": 30,       # 图表显示的历史天数 (显示完整回溯期)
     "enable_focus_mode": True,       # 启用专注模式，只显示预测相关区域
     "prediction_highlight": True,    # 高亮预测区域
 }

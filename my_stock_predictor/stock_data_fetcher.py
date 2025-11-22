@@ -534,36 +534,45 @@ class StockDataFetcher:
                 with open(meta_filepath, 'r', encoding='utf-8') as f:
                     cached_metadata = json.load(f)
                 
-                data_filename = cached_metadata.get('data_file')
-                if data_filename:
-                    filepath = os.path.join(stock_dir, data_filename)
-                    if os.path.exists(filepath):
-                        print(f"✅ 成功加载缓存数据: {filepath}")
-                        cached_df = pd.read_csv(filepath)
-                        # 加载后，确保timestamps列是datetime对象
-                        cached_df['timestamps'] = pd.to_datetime(cached_df['timestamps'])
+                # 验证周期是否匹配
+                cached_period = cached_metadata.get('period')
+                requested_period_label = self._format_period_label(period)
+                
+                if cached_period != requested_period_label:
+                    print(f"⚠️ 缓存数据周期 ({cached_period}) 与请求周期 ({requested_period_label}) 不匹配，将重新获取。")
+                    refresh_needed = True
+                else:
+                    data_filename = cached_metadata.get('data_file')
+                    if data_filename:
+                        filepath = os.path.join(stock_dir, data_filename)
+                        if os.path.exists(filepath):
+                            print(f"✅ 成功加载缓存数据: {filepath}")
+                            cached_df = pd.read_csv(filepath)
+                            # 加载后，确保timestamps列是datetime对象
+                            cached_df['timestamps'] = pd.to_datetime(cached_df['timestamps'])
 
-                        if min_fresh_days is not None:
-                            freshness_threshold = datetime.now() - timedelta(days=min_fresh_days)
-                            latest_timestamp = cached_df['timestamps'].max()
-                            if pd.isna(latest_timestamp) or latest_timestamp < freshness_threshold:
-                                refresh_needed = True
-                                stale_refresh_triggered = True
-                                if fallback_days is not None:
-                                    query_start_date = (datetime.now() - timedelta(days=fallback_days)).strftime('%Y-%m-%d')
-                                    query_end_date = datetime.now().strftime('%Y-%m-%d')
-                                print(
-                                    f"⚠️ 缓存数据最新时间 {latest_timestamp} 早于 {min_fresh_days} 天前，"
-                                    "将重新获取数据。"
-                                )
-                            else:
-                                print("✅ 缓存数据满足新鲜度要求。")
-                        
-                        if not refresh_needed:
-                            return cached_df, filepath, cached_metadata
+                            if min_fresh_days is not None:
+                                freshness_threshold = datetime.now() - timedelta(days=min_fresh_days)
+                                latest_timestamp = cached_df['timestamps'].max()
+                                if pd.isna(latest_timestamp) or latest_timestamp < freshness_threshold:
+                                    refresh_needed = True
+                                    stale_refresh_triggered = True
+                                    if fallback_days is not None:
+                                        query_start_date = (datetime.now() - timedelta(days=fallback_days)).strftime('%Y-%m-%d')
+                                        query_end_date = datetime.now().strftime('%Y-%m-%d')
+                                    print(
+                                        f"⚠️ 缓存数据最新时间 {latest_timestamp} 早于 {min_fresh_days} 天前，"
+                                        "将重新获取数据。"
+                                    )
+                                else:
+                                    print("✅ 缓存数据满足新鲜度要求。")
+                            
+                            if not refresh_needed:
+                                return cached_df, filepath, cached_metadata
+                        else:
+                            print("⚠️ 缓存数据文件不存在，准备重新获取。")
                     else:
-                        print("⚠️ 缓存数据文件不存在，准备重新获取。")
-                print("⚠️ 缓存元数据不完整或数据文件丢失。")
+                        print("⚠️ 缓存元数据不完整或数据文件丢失。")
             except Exception as e:
                 print(f"⚠️ 加载缓存失败: {e}")
 

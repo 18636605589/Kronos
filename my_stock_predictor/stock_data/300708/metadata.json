@@ -1,9 +1,9 @@
 {
   "symbol": "300708",
   "stock_name": "sz.300708",
-  "latest_timestamp": "2025-11-19 15:00:00",
-  "data_points": 11520,
-  "period": "5min",
-  "last_updated": "2025-11-20 16:00:30",
-  "data_file": "300708_5min_20251120_160030.csv"
+  "latest_timestamp": "2025-11-21 15:00:00",
+  "data_points": 1908,
+  "period": "60min",
+  "last_updated": "2025-11-22 17:13:57",
+  "data_file": "300708_60min_20251122_171357.csv"
 }
