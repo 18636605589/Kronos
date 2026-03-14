@@ -1,9 +1,9 @@
 {
   "symbol": "000876",
   "stock_name": "sz.000876",
-  "latest_timestamp": "2026-03-13 15:00:00",
-  "data_points": 944,
-  "period": "60min",
-  "last_updated": "2026-03-14 17:36:28",
-  "data_file": "000876_60min_20260314_173628.csv"
+  "latest_timestamp": "2026-03-13 00:00:00",
+  "data_points": 476,
+  "period": "daily",
+  "last_updated": "2026-03-14 18:05:00",
+  "data_file": "000876_daily_20260314_180500.csv"
 }

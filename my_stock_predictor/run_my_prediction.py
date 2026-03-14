@@ -41,8 +41,6 @@ from constants import (
 # ==============================================================================
 # === 预测配置 ===
 # ==============================================================================
-# 设备配置 - 根据你的硬件情况选择
-import os
 # 设置设备选择:
 # 'auto' = 自动检测 (推荐)
 # 'cpu' = 强制使用CPU (稳定但较慢)
@@ -102,14 +100,20 @@ PREDICTION_CONFIG = {
     # --- 数据获取时间范围 ---
     "start_date": None,         # 数据开始日期 (None 表示自动根据 fallback_fetch_days 计算)
     "end_date": None,           # 数据结束日期 (None 表示使用当前日期)
-    "period": "60",             # 数据频率 ('5', '15', '30', '60' for 分钟, 'D' for 日线) - 切换为60分钟线
+    "period": "D",             # 数据频率 ('5', '15', '30', '60' for 分钟, 'D' for 日线) - 切换为日线以减少日内噪音
 
     # --- 预测参数 (使用带有单位的时间字符串) ---
     # 回溯不宜过长：Kronos 内部用历史均值做 z-score，若股价涨跌幅度大，
     # 过长回溯导致均值远离当前价位，预测会回归到偏低/偏高的历史均值。
     # 60d 是通用默认值；对近期涨跌幅超 50% 的强趋势股可缩短到 30d。
-    "lookback_duration": "60d",    # 60天约240个点（通用默认值）
-    "pred_len_duration": "5d",    # 预测时长 (单位: d=天, h=小时, M=月) - 预测未来5天 (约20个点)
+    "lookback_duration": "60d",    # 60天约60个点（日线模式）
+    # 1d 约4-8个点（更短的预测长度更能抵御均值回归的误差，提升真实胜率）
+    "pred_len_duration": "1d",    # 预测时长 (单位: d=天, h=小时, M=月) - 预测未来1天
+
+    # --- 数据降维 (实验性) ---
+    # 如果开启，模型在预处理时只保留 'close' 价格列，移除高开低和成交量等特征
+    # 对于纯时序大模型（如 Kronos），单变量有时候比多变量噪音更少，方向预测更准。
+    "use_close_only": False,
 
     # --- 模型采样参数 ---
     # 以下参数由 tune 模式自动调优得出（--mode tune），最佳 MAPE=0.79%
@@ -220,57 +224,15 @@ class UnifiedPredictor:
         required_points_total = lookback_steps + pred_len_steps
         minimum_points_needed = lookback_steps if is_future_mode else required_points_total
 
-        # === 智能预检：提前检测数据量是否足够 ===
-        print("🔍 正在进行数据可用性预检...")
-        precheck_points_needed = minimum_points_needed
-        precheck_days = self._estimate_required_days(int(precheck_points_needed * 1.2), config['period'])  # 多获取20%作为缓冲
-
-        # 将'period'转换为数据源能理解的格式
-        period_map = {'5': '5m', '15': '15m', '30': '30m', '60': '60m', 'D': '1d'}
-        precheck_period = config['period']
-        if config['source'] == 'yfinance':
-            precheck_period = period_map.get(config['period'], '1d')
-
-        print(f"   - 预检目标: 至少{precheck_points_needed}个数据点，估算需要{precheck_days}天数据")
-
-        precheck_df, _, _ = self.fetcher.get_stock_data(
-            symbol=config['symbol'],
-            source=config['source'],
-            start_date=None,
-            end_date=None,
-            period=precheck_period,
-            save=False,  # 预检不保存
-            force_refetch=False,
-            min_fresh_days=config.get('min_data_freshness_days'),
-            fallback_days=precheck_days
-        )
-
-        if precheck_df is not None and len(precheck_df) >= precheck_points_needed:
-            print(f"   - ✅ 预检通过: 获取到{len(precheck_df)}个数据点，满足最低要求")
-            if not is_future_mode and len(precheck_df) < required_points_total:
-                print(f"   - ⚠️ 注意: 数据点({len(precheck_df)})不足以完整回测({required_points_total})，将仅进行未来预测")
-                is_future_mode = True
-                config["forecast_future"] = True
-                print(f"   - 🔄 已切换到未来预测模式")
-        else:
-            print(f"   - ❌ 预检失败: 只有{len(precheck_df) if precheck_df is not None else 0}个数据点")
-            if precheck_df is None:
-                print("❌ 数据获取完全失败，流程终止。")
-                return
-            else:
-                print(f"⚠️ 数据不足，将尝试扩展获取范围...")
-        print("="*60)
-
-        # === 步骤 1: 获取数据 ===
+        # === 步骤 1: 获取数据（一次获取，避免重复请求） ===
         print("📊 正在获取数据...")
         print(f"   - 当前模式: {'未来预测' if is_future_mode else '回测'}")
         print(f"   - 至少需要 {minimum_points_needed} 个数据点")
-        
-        # 将'period'转换为'akshare'和'yfinance'能理解的格式
-        period_map = {'5': '5m', '15': '15m', '30': '30m', '60': '60m', 'D': '1d'}
+
         fetch_period = config['period']
         if config['source'] == 'yfinance':
-            fetch_period = period_map.get(config['period'], '1d')
+            from constants import PERIOD_MAP
+            fetch_period = PERIOD_MAP.get(config['period'], '1d')
 
         df, filepath, metadata = self.fetcher.get_stock_data(
             symbol=config['symbol'],
@@ -284,23 +246,19 @@ class UnifiedPredictor:
             fallback_days=config.get('fallback_fetch_days')
         )
 
-        if filepath is None or df is None:
+        if df is None:
             print("❌ 获取数据失败，流程终止。")
             print("🔧 可能的解决方案:")
             print("  1. 检查网络连接是否正常")
             print(f"  2. 检查股票代码 '{config['symbol']}' 是否正确")
             print(f"  3. 检查数据源 '{config['source']}' 是否可用")
-            print(f"  4. 尝试更换数据源或调整时间范围")
             return
 
+        # 数据不足时尝试扩展获取范围
         if len(df) < minimum_points_needed:
             print(f"⚠️ 当前数据点 {len(df)} 少于所需的 {minimum_points_needed}，尝试扩展抓取范围...")
             minimum_days = self._estimate_required_days(minimum_points_needed, config['period'])
-            fallback_days = config.get('fallback_fetch_days')
-            if fallback_days is None:
-                fallback_days = minimum_days
-            else:
-                fallback_days = max(fallback_days, minimum_days)
+            fallback_days = max(config.get('fallback_fetch_days') or 0, minimum_days)
 
             df, filepath, metadata = self.fetcher.get_stock_data(
                 symbol=config['symbol'],
@@ -314,24 +272,21 @@ class UnifiedPredictor:
                 fallback_days=fallback_days
             )
 
-            if filepath is None or df is None:
-                print("❌ 扩展抓取仍失败，流程终止。")
-                print("🔧 建议的解决方案:")
-                print("  1. 检查是否存在网络限制或API限制")
-                print(f"  2. 减少预测时长或增加数据频率从 '{config['period']}' 到更粗的时间粒度")
-                print(f"  3. 减少回溯时长从 '{config['lookback_duration']}' 到更短的时间范围")
-                print("  4. 使用不同的数据源")
+            if df is None or len(df) < minimum_points_needed:
+                actual = len(df) if df is not None else 0
+                print(f"❌ 数据量不足: 实际{actual}条, 需要{minimum_points_needed}条")
+                print("🔧 建议: 减少 lookback_duration/pred_len_duration 或使用更粗的时间粒度")
                 return
 
-            if len(df) < minimum_points_needed:
-                print(f"❌ 扩展后数据量 {len(df)} 仍不足以支持当前配置(需要 {minimum_points_needed})")
-                print("🔧 参数调整建议:")
-                print(f"  1. 当前需要约 {self._estimate_required_days(minimum_points_needed, config['period'])} 天的历史数据")
-                print("  2. 建议减少 lookback_duration 或 pred_len_duration 参数")
-                print("  3. 或使用更大的数据频率间隔")
-                return
+        # 回测模式下如果数据不够完整回测，自动切换为未来预测
+        if not is_future_mode and len(df) < required_points_total:
+            print(f"⚠️ 数据点({len(df)})不足以完整回测({required_points_total})，自动切换到未来预测模式")
+            is_future_mode = True
+            config["forecast_future"] = True
 
-        print(f"✅ 数据获取成功，已保存/加载于: {filepath}")
+        print(f"✅ 数据获取成功: {len(df)} 条数据")
+        if filepath:
+            print(f"   文件: {filepath}")
         print("="*60)
 
         # === 数据量检查和智能裁剪 ===
@@ -419,7 +374,10 @@ class UnifiedPredictor:
             # --- 未来预测模式 ---
             print("   - 模式: 未来预测")
             # 预测的输入数据是所有我们能获取到的历史数据
-            x_df = df[['open', 'high', 'low', 'close', 'volume', 'amount']]
+            if config.get('use_close_only', False):
+                x_df = df[['close']]
+            else:
+                x_df = df[['open', 'high', 'low', 'close', 'volume', 'amount']]
             x_timestamp = df['timestamps']
             # 生成未来的时间戳
             y_timestamp = self._generate_future_timestamps(df['timestamps'].iloc[-1], pred_len_steps, config['period'])
@@ -438,7 +396,10 @@ class UnifiedPredictor:
             subset_df = df.tail(required_points_total).reset_index(drop=True)
             # ⚠️ 这里需要先创建临时predictor来调用prepare_backtest_data方法
             # 为了保持一致性，我们手动切分但保存ground_truth
-            x_df = subset_df.iloc[:lookback_steps][['open', 'high', 'low', 'close', 'volume', 'amount']].copy()
+            if config.get('use_close_only', False):
+                x_df = subset_df.iloc[:lookback_steps][['close']].copy()
+            else:
+                x_df = subset_df.iloc[:lookback_steps][['open', 'high', 'low', 'close', 'volume', 'amount']].copy()
             x_timestamp = subset_df.iloc[:lookback_steps]['timestamps'].copy()
             y_timestamp = subset_df.iloc[lookback_steps:lookback_steps+pred_len_steps]['timestamps'].copy()
             
@@ -447,7 +408,24 @@ class UnifiedPredictor:
             ground_truth.index = y_timestamp.values
             print(f"   - ✅ 已准备回测数据并保存真实值用于验证")
 
-        # 指定结果保存目录为当前脚本所在目录下的 prediction_results
+        # 智能动态计算绘图的历史天数，避免短线预测挤在图表边缘
+        pred_days = 1
+        if 'd' in config['pred_len_duration']:
+            pred_days = int(config['pred_len_duration'].replace('d', ''))
+        else:
+            period_int = int(config['period']) if str(config['period']).isdigit() else 60
+            points_per_day = 240 / period_int if period_int > 0 else 4
+            pred_days = max(1, int(pred_len_steps / points_per_day))
+            
+        if config.get('enable_focus_mode', True):
+            original_lookback = config.get('plot_lookback_days', 30)
+            if original_lookback > pred_days * 5:
+                # 动态计算至少显示几天：预测天数的5倍，最低不少于3天
+                smart_lookback = max(3, pred_days * 5)
+                config['plot_lookback_days'] = smart_lookback
+                print(f"   - 👁️ 已智能调整图表显示历史天数为 {smart_lookback} 天 (原{original_lookback}天)，以优化超短线视觉效果。")
+
+        # 结果保存到脚本所在目录下的 prediction_results/
         results_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "prediction_results")
         predictor = StockPredictor(
             device=os.environ.get('DEVICE', 'auto'),  # 使用环境变量设置的设备
@@ -674,9 +652,14 @@ class UnifiedPredictor:
         mape = np.mean(np.abs((true_close - pred_close) / true_close)) * 100
         
         # 方向准确率（预测涨跌方向的准确性）
-        true_direction = np.sign(true_close.diff().dropna())
-        pred_direction = np.sign(pred_close.diff().dropna())
-        direction_accuracy = np.mean(true_direction == pred_direction) * 100
+        true_diff = true_close.diff().dropna()
+        pred_diff = pred_close.diff().dropna()
+        if len(true_diff) > 0 and len(pred_diff) > 0:
+            true_direction = np.sign(true_diff)
+            pred_direction = np.sign(pred_diff)
+            direction_accuracy = np.mean(true_direction == pred_direction) * 100
+        else:
+            direction_accuracy = 0.0
         
         print(f"📊 回测准确性指标:")
         print(f"   - RMSE (均方根误差): {rmse:.4f}")
@@ -684,27 +667,30 @@ class UnifiedPredictor:
         print(f"   - MAPE (平均绝对百分比误差): {mape:.2f}%")
         print(f"   - 方向准确率: {direction_accuracy:.1f}%")
         
-        # 评估准确性等级
-        print(f"\n📈 准确性评级:")
-        if mape < 5:
-            print(f"   ✅ 优秀 (MAPE < 5%)")
-            print(f"   🎯 预测非常准确，可以信赖该模型")
+        # 评估准确性等级（二维评价： MAPE 和 方向准确率）
+        print(f"\n📈 综合准确性评级:")
+        if mape < 3 and direction_accuracy >= 55:
+            print(f"   ✅ 优秀 (MAPE < 3% 且 胜率 >= 55%)")
+            print(f"   🎯 方向与点位双优，可以信赖该模型")
+        elif mape < 5 and direction_accuracy >= 50:
+            print(f"   ✅ 良好 (MAPE < 5% 且 胜率 >= 50%)")
+            print(f"   👍 预测较为准确，可作为交易辅助参考")
         elif mape < 10:
-            print(f"   ✅ 良好 (MAPE < 10%)")
-            print(f"   👍 预测较为准确，可以作为参考")
-        elif mape < 20:
-            print(f"   ⚠️ 一般 (MAPE < 20%)")
-            print(f"   💡 建议调整模型参数或增加训练数据")
+            print(f"   ⚠️ 一般 (MAPE < 10% 但方向准确率低于预期)")
+            print(f"   💡 虽然点位偏差不大，但涨跌方向参考价值低")
         else:
-            print(f"   ❌ 较差 (MAPE >= 20%)")
-            print(f"   🔧 建议重新调整模型参数或检查数据质量")
+            print(f"   ❌ 较差 (MAPE >= 10% 或 严重背离)")
+            print(f"   🔧 模型在此时断完全失效，不可参考")
             
         # 额外的细节信息
         price_range = true_close.max() - true_close.min()
         print(f"\n📉 详细统计:")
         print(f"   - 真实价格范围: {true_close.min():.2f} - {true_close.max():.2f} (波动: {price_range:.2f})")
         print(f"   - 预测价格范围: {pred_close.min():.2f} - {pred_close.max():.2f}")
-        print(f"   - 相对误差 (RMSE/价格范围): {rmse/price_range*100:.2f}%")
+        if price_range > 0:
+            print(f"   - 相对误差 (RMSE/价格范围): {rmse/price_range*100:.2f}%")
+        else:
+            print(f"   - 相对误差: 真实数据无波动，无法计算")
 
     def run_tuning(self, config):
         """
@@ -720,11 +706,10 @@ class UnifiedPredictor:
         
         print(f"📊 正在获取数据用于调优 (回溯: {lookback_steps}, 预测: {pred_len_steps})...")
         
-        # 转换周期格式
-        period_map = {'5': '5m', '15': '15m', '30': '30m', '60': '60m', 'D': '1d'}
         fetch_period = config['period']
         if config['source'] == 'yfinance':
-            fetch_period = period_map.get(config['period'], '1d')
+            from constants import PERIOD_MAP
+            fetch_period = PERIOD_MAP.get(config['period'], '1d')
 
         df, filepath, _ = self.fetcher.get_stock_data(
             symbol=config['symbol'],
@@ -797,11 +782,11 @@ class UnifiedPredictor:
         print("-" * 60)
         
         # 初始化预测器
-        results_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tuning_results")
+        tuning_results_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tuning_results")
         predictor = StockPredictor(
             device=os.environ.get('DEVICE', 'auto'),
-            results_dir=results_dir,
-            enable_adaptive_tuning=False # 调优时必须关闭自适应
+            results_dir=tuning_results_dir,
+            enable_adaptive_tuning=False
         )
         
         # 4. 遍历参数
@@ -870,7 +855,7 @@ class UnifiedPredictor:
             from datetime import datetime
             
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            report_dir = os.path.join(results_dir, config['symbol'], 'tuning_reports')
+            report_dir = os.path.join(tuning_results_dir, config['symbol'], 'tuning_reports')
             os.makedirs(report_dir, exist_ok=True)
             
             # 1. 保存为 CSV (方便Excel查看)
@@ -967,6 +952,22 @@ class UnifiedPredictor:
             print(f"   建议：增大 fallback_fetch_days 或减少 rolling_windows")
             return
 
+        # 智能动态计算绘图的历史天数，避免短线预测挤在图表边缘
+        pred_days = 1
+        if 'd' in config['pred_len_duration']:
+            pred_days = int(config['pred_len_duration'].replace('d', ''))
+        else:
+            period_int = int(config['period']) if str(config['period']).isdigit() else 60
+            points_per_day = 240 / period_int if period_int > 0 else 4
+            pred_days = max(1, int(pred_len_steps / points_per_day))
+            
+        if config.get('enable_focus_mode', True):
+            original_lookback = config.get('plot_lookback_days', 30)
+            if original_lookback > pred_days * 5:
+                smart_lookback = max(3, pred_days * 5)
+                config['plot_lookback_days'] = smart_lookback
+                print(f"   - 👁️ 已智能调整滚动回测图表显示历史天数为 {smart_lookback} 天 (原{original_lookback}天)。")
+
         # 根据实际数据量自动调整窗口数
         actual_n = min(n_windows, len(df) // window_size)
         if actual_n < n_windows:
@@ -994,7 +995,10 @@ class UnifiedPredictor:
             print(f"\n[{win_label}] {ts_start} → {ts_end}")
 
             # 准备该窗口的训练集和验证集
-            x_df        = slice_df.iloc[:lookback_steps][['open', 'high', 'low', 'close', 'volume', 'amount']].copy()
+            if config.get('use_close_only', False):
+                x_df = slice_df.iloc[:lookback_steps][['close']].copy()
+            else:
+                x_df = slice_df.iloc[:lookback_steps][['open', 'high', 'low', 'close', 'volume', 'amount']].copy()
             x_timestamp = slice_df.iloc[:lookback_steps]['timestamps'].copy()
             y_timestamp = slice_df.iloc[lookback_steps:]['timestamps'].copy()
             ground_truth = slice_df.iloc[lookback_steps:][['open', 'high', 'low', 'close', 'volume', 'amount']].copy()

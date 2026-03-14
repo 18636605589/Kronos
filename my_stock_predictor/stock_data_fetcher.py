@@ -348,9 +348,14 @@ class StockDataFetcher:
                 }
                 frequency = freq_map.get(period, '5')
 
+                if frequency in ['d', 'w', 'm']:
+                    columns_str = "date,open,high,low,close,volume,amount"
+                else:
+                    columns_str = "date,time,open,high,low,close,volume,amount"
+
                 rs = bs.query_history_k_data_plus(
                     symbol,
-                    "date,time,open,high,low,close,volume,amount",
+                    columns_str,
                     start_date=start_date,
                     end_date=end_date,
                     frequency=frequency,
@@ -375,7 +380,10 @@ class StockDataFetcher:
                     return None, None
 
                 # 转换为DataFrame
-                columns = ['date', 'time', 'open', 'high', 'low', 'close', 'volume', 'amount']
+                if frequency in ['d', 'w', 'm']:
+                    columns = ['date', 'open', 'high', 'low', 'close', 'volume', 'amount']
+                else:
+                    columns = ['date', 'time', 'open', 'high', 'low', 'close', 'volume', 'amount']
                 df = pd.DataFrame(data_list, columns=columns)
 
                 # 处理时间戳（优化：使用向量化操作）
@@ -415,7 +423,10 @@ class StockDataFetcher:
                                 timestamps.append(pd.NaT)
                     return pd.Series(timestamps)
 
-                df['timestamps'] = parse_timestamp_vectorized(df['date'], df['time'])
+                if 'time' in df.columns:
+                    df['timestamps'] = parse_timestamp_vectorized(df['date'], df['time'])
+                else:
+                    df['timestamps'] = pd.to_datetime(df['date'])
                 
                 # 检查是否有无效时间戳
                 invalid_timestamps = df['timestamps'].isna().sum()

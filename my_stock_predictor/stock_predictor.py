@@ -226,29 +226,38 @@ class StockPredictor:
         print(f"ℹ️ 使用指定设备: {device}")
         return device
     
-    def validate_data(self, df: pd.DataFrame, context: str = "general") -> Tuple[bool, str]:
+    def validate_data(self, df: pd.DataFrame, context: str = "general",
+                      min_points_override: Optional[int] = None) -> Tuple[bool, str]:
         """
         验证数据质量和完整性
 
         Args:
             df: 输入数据框
             context: 验证上下文描述
+            min_points_override: 最小数据点数覆盖值，用于对预测输入等场景放宽限制
 
         Returns:
             (is_valid, error_message)
         """
         try:
-            # 1. 检查必要列是否存在
-            missing_cols = set(self.data_config['required_columns']) - set(df.columns)
-            if missing_cols:
-                return False, f"缺少必要列: {missing_cols}"
-
-            # 2. 检查时间戳列
+            # 1. 检查核心列是否存在
+            if 'close' not in df.columns:
+                return False, "缺少核心列: close"
+                
+            # 检查时间戳列
             if self.data_config['timestamp_column'] not in df.columns:
                 return False, f"缺少时间戳列: {self.data_config['timestamp_column']}"
+                
+            # 兼容单变量模式：如果只传入了极少的列，则跳过完整列检查
+            if len(df.columns) <= 2 or 'open' not in df.columns:
+                self.logger.info("检测到非全特征数据输入(如单变量模式)，跳过严格列校验。")
+            else:
+                missing_cols = set(self.data_config['required_columns']) - set(df.columns)
+                if missing_cols:
+                    return False, f"缺少必要列: {missing_cols}"
 
             # 3. 检查数据量是否足够
-            min_required = self.data_config['min_data_points']
+            min_required = min_points_override if min_points_override is not None else self.data_config['min_data_points']
             if len(df) < min_required:
                 return False, f"数据点严重不足: {len(df)} < {min_required} (至少需要{min_required}个点)"
             
@@ -257,22 +266,25 @@ class StockPredictor:
                  self.logger.warning(f"数据量较少 ({len(df)}), 可能影响模型效果 (推荐 > 500)")
 
             # 4. 检查NaN值比例
-            nan_ratio = df[self.data_config['required_columns']].isnull().sum().sum() / (len(df) * len(self.data_config['required_columns']))
-            if nan_ratio > self.data_config['max_nan_ratio']:
-                return False, f"NaN值比例过高: {nan_ratio:.2%} > {self.data_config['max_nan_ratio']:.2%}"
+            check_cols = [c for c in self.data_config['required_columns'] if c in df.columns]
+            if check_cols:
+                nan_ratio = df[check_cols].isnull().sum().sum() / (len(df) * len(check_cols))
+                if nan_ratio > self.data_config['max_nan_ratio']:
+                    return False, f"NaN值比例过高: {nan_ratio:.2%} > {self.data_config['max_nan_ratio']:.2%}"
 
             # 5. 检查价格数据合理性
-            price_cols = ['open', 'high', 'low', 'close']
+            price_cols = [c for c in ['open', 'high', 'low', 'close'] if c in df.columns]
             for col in price_cols:
                 if (df[col] <= 0).any():
                     return False, f"发现非正价格值在列 {col}"
 
                 # 检查high >= max(open, close), low <= min(open, close)
-                if col == 'high':
+                # 只有在这些列都存在时才检查
+                if col == 'high' and 'open' in df.columns and 'close' in df.columns:
                     invalid_high = df['high'] < df[['open', 'close']].max(axis=1)
                     if invalid_high.any():
                         return False, f"发现high价格低于open或close"
-                elif col == 'low':
+                elif col == 'low' and 'open' in df.columns and 'close' in df.columns:
                     invalid_low = df['low'] > df[['open', 'close']].min(axis=1)
                     if invalid_low.any():
                         return False, f"发现low价格高于open或close"
@@ -288,7 +300,8 @@ class StockPredictor:
 
     def preprocess_data(self, df: pd.DataFrame, detect_outliers: bool = True,
                        enable_advanced: bool = False, normalization: str = "none",
-                       trend_adjustment: bool = False, volatility_filter: bool = False) -> pd.DataFrame:
+                       trend_adjustment: bool = False, volatility_filter: bool = False,
+                       min_points_override: Optional[int] = None) -> pd.DataFrame:
         """
         数据预处理和清理（增强版）
 
@@ -299,6 +312,7 @@ class StockPredictor:
             normalization: 归一化方法 ('standard', 'robust', 'none')
             trend_adjustment: 是否启用趋势调整
             volatility_filter: 是否启用波动率过滤
+            min_points_override: 最小数据点数覆盖值
 
         Returns:
             处理后的数据框
@@ -306,15 +320,15 @@ class StockPredictor:
         try:
             logger.info("开始数据预处理...")
 
-            # 首先验证输入数据
-            is_valid, error_msg = self.validate_data(df, "preprocessing_input")
+            is_valid, error_msg = self.validate_data(df, "preprocessing_input",
+                                                      min_points_override=min_points_override)
             if not is_valid:
                 raise ValueError(f"输入数据验证失败: {error_msg}")
 
             processed_df = df.copy()
 
             # 1. 处理缺失值
-            numeric_cols = REQUIRED_COLUMNS
+            numeric_cols = [c for c in REQUIRED_COLUMNS if c in processed_df.columns]
             for col in numeric_cols:
                 if processed_df[col].isnull().any():
                     # 使用前向填充，然后后向填充
@@ -350,7 +364,8 @@ class StockPredictor:
             processed_df = processed_df.sort_values(TIMESTAMP_COLUMN).reset_index(drop=True)
 
             # 7. 最终验证处理后的数据
-            is_valid, error_msg = self.validate_data(processed_df, "preprocessing_output")
+            is_valid, error_msg = self.validate_data(processed_df, "preprocessing_output",
+                                                      min_points_override=min_points_override)
             if not is_valid:
                 logger.warning(f"预处理后数据存在问题: {error_msg}，但继续执行")
 
@@ -860,7 +875,7 @@ class StockPredictor:
             print(f"数据加载失败: {e}")
             return None
     
-    def prepare_prediction_data(self, df, lookback=1500, pred_len=96):
+    def prepare_prediction_data(self, df, lookback=1500, pred_len=96, use_close_only=False):
         """
         准备预测数据
         
@@ -868,6 +883,7 @@ class StockPredictor:
             df (pd.DataFrame): 股票数据
             lookback (int): 回看窗口大小
             pred_len (int): 预测长度
+            use_close_only (bool): 仅使用 close 列
             
         Returns:
             tuple: (输入数据, 输入时间戳, 输出时间戳)
@@ -880,13 +896,17 @@ class StockPredictor:
             print(f"调整参数: lookback={lookback}, pred_len={pred_len}")
         
         # 准备输入数据
-        x_df = df.loc[:lookback-1, ['open', 'high', 'low', 'close', 'volume', 'amount']]
+        if use_close_only:
+            x_df = df.loc[:lookback-1, ['close']]
+        else:
+            x_df = df.loc[:lookback-1, ['open', 'high', 'low', 'close', 'volume', 'amount']]
+            
         x_timestamp = df.loc[:lookback-1, 'timestamps']
         y_timestamp = df.loc[lookback:lookback+pred_len-1, 'timestamps']
         
         return x_df, x_timestamp, y_timestamp
     
-    def prepare_backtest_data(self, df, lookback=1500, pred_len=96):
+    def prepare_backtest_data(self, df, lookback=1500, pred_len=96, use_close_only=False):
         """
         准备回测数据 - 正确切分训练和测试集
         
@@ -894,6 +914,7 @@ class StockPredictor:
             df: 完整历史数据
             lookback: 训练数据长度
             pred_len: 预测长度（回测长度）
+            use_close_only (bool): 仅使用 close 列
             
         Returns:
             tuple: (训练数据, 训练时间戳, 预测时间戳, 真实测试数据)
@@ -902,13 +923,17 @@ class StockPredictor:
             raise ValueError(f"数据长度({len(df)})不足以进行回测，需要至少 {lookback + pred_len} 个数据点")
         
         # 训练数据：前 lookback 行
-        x_df = df.iloc[:lookback][['open', 'high', 'low', 'close', 'volume', 'amount']].copy()
+        if use_close_only:
+            x_df = df.iloc[:lookback][['close']].copy()
+        else:
+            x_df = df.iloc[:lookback][['open', 'high', 'low', 'close', 'volume', 'amount']].copy()
+            
         x_timestamp = df.iloc[:lookback]['timestamps'].copy()
         
         # 预测时间戳：接下来 pred_len 行的时间戳
         y_timestamp = df.iloc[lookback:lookback+pred_len]['timestamps'].copy()
         
-        # 真实数据：用于后续验证（ground truth）
+        # 真实数据：用于后续验证（ground truth，这里保存所有列以便进行全面的回测验证）
         ground_truth = df.iloc[lookback:lookback+pred_len][['open', 'high', 'low', 'close', 'volume', 'amount']].copy()
         ground_truth.index = y_timestamp.values  # 设置索引为时间戳
         
@@ -1159,17 +1184,9 @@ class StockPredictor:
 
         return processed_df
 
-    def _calculate_smart_xticks(self, timestamps, pred_start_time=None, max_ticks=15, is_future_forecast=False):
+    def _calculate_smart_xticks(self, timestamps, pred_start_time=None, max_ticks=12, is_future_forecast=False):
         """
-        计算智能时间轴刻度，越接近当前时间显示越详细
-
-        Args:
-            timestamps: 所有时间戳
-            pred_start_time: 预测开始时间 (如果为None则自动计算)
-            max_ticks: 最大刻度数量
-
-        Returns:
-            智能刻度位置和标签
+        计算智能时间轴刻度，保证不拥挤、不重叠
         """
         if timestamps.empty:
             return [], []
@@ -1177,124 +1194,84 @@ class StockPredictor:
         timestamps = pd.to_datetime(timestamps)
         start_time = timestamps.min()
         end_time = timestamps.max()
-        total_duration = end_time - start_time
-        
-        # 确定预测开始时间
-        if pred_start_time is None:
-            # 默认取最后1/5作为预测区域估计
-            pred_start = start_time + total_duration * 0.8
+        total_days = (end_time - start_time).total_seconds() / 86400
+
+        if total_days <= 0:
+            return [start_time], [start_time.strftime('%m-%d')]
+
+        pred_start = pd.to_datetime(pred_start_time) if pred_start_time is not None else None
+
+        # 根据总天数选择合适的刻度间隔
+        if total_days <= 7:
+            freq = 'D'
+        elif total_days <= 30:
+            freq = '3D'
+        elif total_days <= 90:
+            freq = 'W'
+        elif total_days <= 365:
+            freq = '2W'
         else:
-            pred_start = pd.to_datetime(pred_start_time)
+            freq = 'MS'
 
-        # 计算关键时间点
-        current_time = pd.Timestamp.now()
+        base_ticks = list(pd.date_range(start=start_time, end=end_time, freq=freq))
 
-        # 根据时间跨度确定刻度密度
-        total_hours = total_duration.total_seconds() / 3600
-        
-        # 动态调整频率，确保至少有5个基础刻度
-        if total_hours <= 24:  # 1天内
-            base_freq = 'H'      # 每小时
-        elif total_hours <= 168:  # 1周内
-            base_freq = 'D'      # 每天
-        elif total_hours <= 720:  # 1月内
-            base_freq = '2D'     # 每2天
-        elif total_hours <= 2160: # 3个月内
-            base_freq = 'W'      # 每周
-        else:  # 更长时间
-            base_freq = 'M'      # 每月
+        # 确保首尾时间点在刻度中
+        if base_ticks and base_ticks[0] > start_time:
+            base_ticks.insert(0, start_time)
+        if base_ticks and base_ticks[-1] < end_time:
+            base_ticks.append(end_time)
 
-        # 生成基础刻度
-        base_ticks = pd.date_range(start=start_time, end=end_time, freq=base_freq)
-        
-        # 如果基础刻度太少，强制加密
-        if len(base_ticks) < 5:
-            if total_hours <= 24: base_freq = '30min'
-            elif total_hours <= 168: base_freq = '6H'
-            elif total_hours <= 720: base_freq = '12H'
-            else: base_freq = '5D'
-            base_ticks = pd.date_range(start=start_time, end=end_time, freq=base_freq)
+        # 加入预测开始时间作为关键刻度
+        if pred_start is not None and start_time <= pred_start <= end_time:
+            base_ticks.append(pred_start)
 
-        # 在关键区域添加密集刻度
-        dense_ticks = []
-        
-        # 预测开始时间前后的密集刻度
-        # 关键区域范围：总时长的10%，但不超过24小时
-        focus_window_hours = min(total_hours * 0.1, 24)
-        
-        pred_dense_start = pred_start - pd.Timedelta(hours=focus_window_hours)
-        pred_dense_end = pred_start + pd.Timedelta(hours=focus_window_hours)
-        
-        if pred_dense_start < end_time and pred_dense_end > start_time:
-            # 密集频率是基础频率的1/4
-            dense_ticks.extend(pd.date_range(
-                start=max(pred_dense_start, start_time),
-                end=min(pred_dense_end, end_time),
-                periods=5 # 强制在关键区域生成至少5个点
-            ))
+        all_ticks = sorted(set(base_ticks))
 
-        # 当前时间前后的密集刻度（如果是未来预测）
-        if is_future_forecast and abs(current_time - end_time) < pd.Timedelta(days=30):
-            current_dense_start = current_time - pd.Timedelta(hours=focus_window_hours)
-            current_dense_end = min(current_time + pd.Timedelta(hours=focus_window_hours), end_time)
-            
-            if current_dense_start < end_time and current_dense_end > start_time:
-                dense_ticks.extend(pd.date_range(
-                    start=max(current_dense_start, start_time),
-                    end=current_dense_end,
-                    periods=5
-                ))
-
-        # 合并所有刻度并去重
-        all_ticks = sorted(set(base_ticks).union(set(dense_ticks)))
-        # 过滤掉范围外的时间点
-        all_ticks = [t for t in all_ticks if start_time <= t <= end_time]
-
-        # 限制刻度数量
-        if len(all_ticks) > max_ticks:
-            # 优先保留关键区域的刻度
-            key_ticks = []
-            other_ticks = []
-
-            for tick in all_ticks:
-                is_key = False
-                # 检查是否在预测开始时间附近
-                if abs(tick - pred_start) < pd.Timedelta(hours=focus_window_hours):
-                    is_key = True
-                # 检查是否在当前时间附近
-                if is_future_forecast and abs(tick - current_time) < pd.Timedelta(hours=focus_window_hours):
-                    is_key = True
-                
-                if is_key:
-                    key_ticks.append(tick)
-                else:
-                    other_ticks.append(tick)
-
-            # 保留所有关键刻度，然后均匀采样其他刻度
-            remaining_slots = max_ticks - len(key_ticks)
-            if remaining_slots > 0 and other_ticks:
-                step = max(1, len(other_ticks) // remaining_slots)
-                sampled_other = other_ticks[::step][:remaining_slots]
-                all_ticks = sorted(set(key_ticks + sampled_other))
+        # 去掉过于接近的刻度（间距小于总跨度的5%则合并，保留关键刻度）
+        min_gap = pd.Timedelta(days=max(1, total_days * 0.05))
+        filtered = []
+        for tick in all_ticks:
+            is_key = pred_start is not None and tick == pred_start
+            if not filtered:
+                filtered.append(tick)
+            elif tick - filtered[-1] < min_gap:
+                prev_is_key = pred_start is not None and filtered[-1] == pred_start
+                if is_key and not prev_is_key:
+                    filtered[-1] = tick
             else:
-                # 如果关键刻度本身就很多，也进行采样
-                if len(key_ticks) > max_ticks:
-                     step = len(key_ticks) // max_ticks
-                     all_ticks = key_ticks[::step]
-                else:
-                    all_ticks = sorted(key_ticks)
+                filtered.append(tick)
+        all_ticks = filtered
 
-        # 生成刻度标签
+        # 限制最大刻度数量（均匀采样，但保留关键刻度）
+        if len(all_ticks) > max_ticks:
+            key_indices = set()
+            if pred_start is not None:
+                for i, t in enumerate(all_ticks):
+                    if t == pred_start:
+                        key_indices.add(i)
+            key_indices.add(0)
+            key_indices.add(len(all_ticks) - 1)
+
+            other_indices = [i for i in range(len(all_ticks)) if i not in key_indices]
+            remaining = max_ticks - len(key_indices)
+            if remaining > 0 and other_indices:
+                step = max(1, len(other_indices) // remaining)
+                sampled = set(other_indices[::step][:remaining])
+            else:
+                sampled = set()
+            keep = sorted(key_indices | sampled)
+            all_ticks = [all_ticks[i] for i in keep]
+
+        # 生成标签：统一使用短格式
         tick_labels = []
         for tick in all_ticks:
-            if total_hours <= 24:  # 1天内显示时分
-                tick_labels.append(tick.strftime('%H:%M'))
-            elif total_hours <= 168:  # 1周内显示日期和小时
-                tick_labels.append(tick.strftime('%m-%d %Hh'))
-            elif total_hours <= 24 * 60: # 2个月内
+            is_key = pred_start is not None and abs(tick - pred_start) < pd.Timedelta(hours=12)
+            if total_days <= 7:
                 tick_labels.append(tick.strftime('%m-%d'))
-            else:  # 更长时间显示年月
-                tick_labels.append(tick.strftime('%Y-%m-%d'))
+            elif total_days <= 180:
+                tick_labels.append(tick.strftime('%m-%d'))
+            else:
+                tick_labels.append(tick.strftime('%Y-%m'))
 
         return all_ticks, tick_labels
     
@@ -1346,15 +1323,17 @@ class StockPredictor:
                 pred_start = pd.to_datetime(start_pred_time)
 
                 if enable_focus_mode and plot_lookback_days:
-                    # 专注模式：只显示预测相关的最近几天数据
+                    focus_start = pred_start - pd.Timedelta(days=plot_lookback_days)
                     focus_end = pred_df.index.max() + pd.Timedelta(days=FOCUS_MODE_MARGIN_DAYS)
-                    focus_start = focus_end - pd.Timedelta(days=plot_lookback_days)
                     historical_plot_df = historical_df[
-                        (hist_timestamps >= focus_start) & (hist_timestamps <= focus_end)
+                        (hist_timestamps >= focus_start) & (hist_timestamps < pred_start)
                     ]
-                    logger.info(f"专注模式: 显示最近{plot_lookback_days}天的历史数据")
+                    if len(historical_plot_df) < 3:
+                        logger.info(f"专注模式数据不足({len(historical_plot_df)}条)，回退到普通模式")
+                        historical_plot_df = historical_df[hist_timestamps < pred_start].tail(plot_lookback)
+                    else:
+                        logger.info(f"专注模式: 显示预测前{plot_lookback_days}天的历史数据({len(historical_plot_df)}条)")
                 else:
-                    # 传统模式：显示指定数量的历史数据点
                     historical_plot_df = historical_df[hist_timestamps < pred_start].tail(plot_lookback)
 
                 logger.info(f"历史数据点数: {len(historical_plot_df)}")
@@ -1392,48 +1371,79 @@ class StockPredictor:
 
             ax1.plot(plot_hist_df['timestamps'], plot_hist_df['close'], label='历史价格', color='blue', linewidth=1.5)
 
+            pred_len = len(pred_df)
+            is_short_pred = pred_len <= 3
+
             # 预测价格线条（支持高亮）
             if prediction_highlight:
-                # 高亮预测区域
                 pred_start_time = pred_df.index.min()
                 pred_end_time = pred_df.index.max()
-                ax1.axvspan(pred_start_time, pred_end_time, alpha=0.1, color='red', label='预测区域')
 
-                # 绘制预测线（更粗，更明显的样式）
+                if is_short_pred:
+                    # 短预测用更宽的高亮带提升可见度
+                    highlight_margin = pd.Timedelta(days=1)
+                    ax1.axvspan(pred_start_time - highlight_margin, pred_end_time + highlight_margin,
+                               alpha=0.15, color='red', label='预测区域')
+                else:
+                    ax1.axvspan(pred_start_time, pred_end_time, alpha=0.1, color='red', label='预测区域')
+
+                marker_size = 10 if is_short_pred else 4
                 ax1.plot(pred_df.index, pred_df['close'], label='预测价格',
-                        color='red', linewidth=3, linestyle='--', marker='o', markersize=4, alpha=0.9)
+                        color='red', linewidth=3, linestyle='--', marker='o',
+                        markersize=marker_size, alpha=0.9, zorder=5)
+
+                # 单点预测时在旁边标注价格值
+                if pred_len == 1:
+                    price_val = pred_df['close'].iloc[0]
+                    ax1.annotate(f'{price_val:.2f}',
+                                xy=(pred_df.index[0], price_val),
+                                xytext=(15, 15), textcoords='offset points',
+                                fontsize=11, fontweight='bold', color='red',
+                                arrowprops=dict(arrowstyle='->', color='red', lw=1.5),
+                                bbox=dict(boxstyle='round,pad=0.3', facecolor='lightyellow', edgecolor='red', alpha=0.9),
+                                zorder=6)
             else:
                 ax1.plot(pred_df.index, pred_df['close'], label='预测价格', color='red', linewidth=2, linestyle='--')
-            
-            # 在回测模式下，添加真实价格曲线
+
+            # 回测模式添加真实价格
             if not is_future_forecast:
                 true_values_df = historical_df[historical_df['timestamps'].isin(pred_df.index)]
-                ax1.plot(true_values_df['timestamps'], true_values_df['close'], label='真实价格', color='green', linewidth=2, alpha=0.8)
+                if not true_values_df.empty:
+                    marker_size = 10 if is_short_pred else 4
+                    ax1.plot(true_values_df['timestamps'], true_values_df['close'], label='真实价格',
+                            color='green', linewidth=2, alpha=0.8,
+                            marker='s' if is_short_pred else None,
+                            markersize=marker_size, zorder=5)
+                    if pred_len == 1:
+                        true_val = true_values_df['close'].iloc[0]
+                        ax1.annotate(f'{true_val:.2f}',
+                                    xy=(true_values_df['timestamps'].iloc[0], true_val),
+                                    xytext=(15, -20), textcoords='offset points',
+                                    fontsize=11, fontweight='bold', color='green',
+                                    arrowprops=dict(arrowstyle='->', color='green', lw=1.5),
+                                    bbox=dict(boxstyle='round,pad=0.3', facecolor='honeydew', edgecolor='green', alpha=0.9),
+                                    zorder=6)
 
-            # 添加关键时间区域标记
             current_time = pd.Timestamp.now()
-
-            # 标记预测开始时间
             pred_start_time = pred_df.index.min()
-            ax1.axvline(pred_start_time, color='orange', linestyle=':', linewidth=1.5, alpha=0.7)
-            ax1.text(pred_start_time, ax1.get_ylim()[1]*0.95, '预测开始',
-                    ha='center', va='top', fontsize=10,
-                    bbox=dict(boxstyle='round,pad=0.3', facecolor='orange', alpha=0.7))
 
-            # 标记当前时间（如果是未来预测且接近当前时间）
+            # 用单条分隔线标记预测起始，避免两条线+两个标签重叠
+            ax1.axvline(pred_start_time, color='orange', linestyle='--', linewidth=1.5, alpha=0.8)
+
+            # 标记标签放在图表上方坐标系内，使用 transform 精确定位避免重叠
+            y_top = ax1.get_ylim()[1]
+            y_bottom = ax1.get_ylim()[0]
+            y_range = y_top - y_bottom
+            ax1.text(pred_start_time, y_top - y_range * 0.02, '预测开始',
+                    ha='right', va='top', fontsize=9,
+                    bbox=dict(boxstyle='round,pad=0.2', facecolor='orange', alpha=0.7))
+
             if is_future_forecast and abs(current_time - all_timestamps.max()) < pd.Timedelta(days=7):
                 ax1.axvline(current_time, color='purple', linestyle=':', linewidth=1.5, alpha=0.7)
-                ax1.text(current_time, ax1.get_ylim()[1]*0.90, '当前时间',
-                        ha='center', va='top', fontsize=10,
-                        bbox=dict(boxstyle='round,pad=0.3', facecolor='purple', alpha=0.7))
-
-            # 标记历史数据结束时间
-            if not historical_plot_df.empty:
-                hist_end_time = historical_plot_df['timestamps'].iloc[-1]
-                ax1.axvline(hist_end_time, color='gray', linestyle='--', linewidth=1, alpha=0.8)
-                ax1.text(hist_end_time, ax1.get_ylim()[0]*1.05, '历史结束',
-                        ha='center', va='bottom', fontsize=9,
-                        bbox=dict(boxstyle='round,pad=0.2', facecolor='gray', alpha=0.6))
+                ax1.text(current_time, y_top - y_range * 0.12, '当前时间',
+                        ha='center', va='top', fontsize=9,
+                        bbox=dict(boxstyle='round,pad=0.2', facecolor='purple', alpha=0.7),
+                        color='white')
             
             # 自动调整Y轴范围，确保价格显示清晰
             all_prices = pd.concat([
@@ -1469,21 +1479,24 @@ class StockPredictor:
             
             # --- 成交量图 ---
             ax2.plot(plot_hist_df['timestamps'], plot_hist_df['volume'], label='历史成交量', color='blue', linewidth=1.5)
-            ax2.plot(pred_df.index, pred_df['volume'], label='预测成交量', color='red', linewidth=2, linestyle='--')
-            
+            vol_marker = 'o' if is_short_pred else None
+            vol_ms = 8 if is_short_pred else 4
+            ax2.plot(pred_df.index, pred_df['volume'], label='预测成交量',
+                    color='red', linewidth=2, linestyle='--',
+                    marker=vol_marker, markersize=vol_ms, zorder=5)
+
             if not is_future_forecast:
                 true_values_df = historical_df[historical_df['timestamps'].isin(pred_df.index)]
-                ax2.plot(true_values_df['timestamps'], true_values_df['volume'], label='真实成交量', color='green', linewidth=2, alpha=0.8)
+                if not true_values_df.empty:
+                    ax2.plot(true_values_df['timestamps'], true_values_df['volume'], label='真实成交量',
+                            color='green', linewidth=2, alpha=0.8,
+                            marker='s' if is_short_pred else None,
+                            markersize=vol_ms, zorder=5)
 
-            # 在成交量图上也添加关键时间标记
-            ax2.axvline(pred_start_time, color='orange', linestyle=':', linewidth=1.5, alpha=0.7)
+            ax2.axvline(pred_start_time, color='orange', linestyle='--', linewidth=1.5, alpha=0.7)
 
             if is_future_forecast and abs(current_time - all_timestamps.max()) < pd.Timedelta(days=7):
                 ax2.axvline(current_time, color='purple', linestyle=':', linewidth=1.5, alpha=0.7)
-
-            if not historical_plot_df.empty:
-                hist_end_time = historical_plot_df['timestamps'].iloc[-1]
-                ax2.axvline(hist_end_time, color='gray', linestyle='--', linewidth=1, alpha=0.8)
             
             ax2.set_ylabel('成交量', fontsize=14)
             ax2.set_xlabel('时间', fontsize=14)
@@ -1492,35 +1505,37 @@ class StockPredictor:
 
             # 设置智能时间轴刻度
             smart_ticks, tick_labels = self._calculate_smart_xticks(
-                all_timestamps, 
+                all_timestamps,
                 pred_start_time=pred_df.index.min(),
-                max_ticks=20, 
+                max_ticks=12,
                 is_future_forecast=is_future_forecast
             )
             if smart_ticks:
                 ax2.set_xticks(smart_ticks)
-                ax2.set_xticklabels(tick_labels, rotation=45, ha='right', fontsize=10)
+                ax2.set_xticklabels(tick_labels, rotation=30, ha='right', fontsize=9)
 
-            # 添加局部放大视图（如果时间跨度较大且预测区域较短）
+            # 放大子图：仅当历史数据足够多、且预测区域相对较短时才显示
             total_duration = all_timestamps.max() - all_timestamps.min()
             pred_duration = pred_df.index.max() - pred_df.index.min()
+            hist_count = len(historical_plot_df)
 
-            if total_duration > pd.Timedelta(days=30) and pred_duration < total_duration * 0.3:
-                # 创建局部放大子图
-                # 计算预测区域的扩展范围（前后各延长10%）
-                pred_range = pred_df.index.max() - pred_df.index.min()
-                zoom_margin = pred_range * 0.2
+            show_zoom = (
+                total_duration > pd.Timedelta(days=20) and
+                pred_duration < total_duration * 0.3 and
+                hist_count > 10
+            )
+            if show_zoom:
+                # 放大窗口：预测前5天到预测结束后1天
+                zoom_margin_before = pd.Timedelta(days=5)
+                zoom_margin_after = pd.Timedelta(days=max(1, pred_duration.days + 1))
+                zoom_start = pred_df.index.min() - zoom_margin_before
+                zoom_end = pred_df.index.max() + zoom_margin_after
 
-                zoom_start = max(all_timestamps.min(), pred_df.index.min() - zoom_margin)
-                zoom_end = min(all_timestamps.max(), pred_df.index.max() + zoom_margin)
-
-                # 创建子图位置
                 from mpl_toolkits.axes_grid1.inset_locator import inset_axes
-                ax_zoom = inset_axes(ax1, width="35%", height="25%", loc='upper right',
+                ax_zoom = inset_axes(ax1, width="35%", height="30%", loc='upper right',
                                     bbox_to_anchor=(0.02, 0.02, 0.96, 0.96),
                                     bbox_transform=ax1.transAxes)
 
-                # 在子图中绘制局部放大的价格数据
                 zoom_hist = historical_plot_df[
                     (historical_plot_df['timestamps'] >= zoom_start) &
                     (historical_plot_df['timestamps'] <= zoom_end)
@@ -1532,20 +1547,30 @@ class StockPredictor:
 
                 if not zoom_hist.empty:
                     ax_zoom.plot(zoom_hist['timestamps'], zoom_hist['close'],
-                               color='blue', linewidth=1, alpha=0.7)
+                               color='blue', linewidth=1.2, alpha=0.8)
                 if not zoom_pred.empty:
                     ax_zoom.plot(zoom_pred.index, zoom_pred['close'],
-                               color='red', linewidth=1.5, linestyle='--', alpha=0.8)
+                               color='red', linewidth=2, linestyle='--', marker='o',
+                               markersize=6, alpha=0.9)
 
-                # 子图样式设置
-                ax_zoom.set_title('预测区域放大', fontsize=9, pad=2)
-                ax_zoom.tick_params(labelsize=8)
+                if not is_future_forecast:
+                    zoom_true = historical_df[
+                        (historical_df['timestamps'].isin(pred_df.index)) &
+                        (historical_df['timestamps'] >= zoom_start) &
+                        (historical_df['timestamps'] <= zoom_end)
+                    ]
+                    if not zoom_true.empty:
+                        ax_zoom.plot(zoom_true['timestamps'], zoom_true['close'],
+                                   color='green', linewidth=1.5, marker='s', markersize=5, alpha=0.8)
+
+                ax_zoom.set_title('预测区域放大', fontsize=9, pad=3)
+                ax_zoom.tick_params(labelsize=7)
+                ax_zoom.xaxis.set_major_formatter(plt.matplotlib.dates.DateFormatter('%m-%d'))
+                ax_zoom.tick_params(axis='x', rotation=20)
                 ax_zoom.grid(True, alpha=0.3)
-
-                # 添加边框
                 for spine in ax_zoom.spines.values():
                     spine.set_edgecolor('orange')
-                    spine.set_linewidth(1)
+                    spine.set_linewidth(1.5)
 
             plt.tight_layout()
             
@@ -1750,15 +1775,13 @@ class StockPredictor:
             comparison_point = historical_df[historical_df['timestamps'] < pred_df.index.min()]
             baseline_close = comparison_point.iloc[-1]['close'] if not comparison_point.empty else historical_df.iloc[-1]['close']
 
-        # 计算预测的变化
         pred_start = pred_df['close'].iloc[0]
         pred_end = pred_df['close'].iloc[-1]
 
         price_change = pred_end - baseline_close
         price_change_pct = (price_change / baseline_close) * 100 if baseline_close != 0 else 0
 
-        # 趋势强度分析
-        pred_trend_strength = abs(pred_end - pred_start) / pred_start if pred_start != 0 else 0
+        pred_trend_strength = abs(pred_end - pred_start) / pred_start if (pred_start != 0 and len(pred_df) > 1) else 0
 
         return {
             'price': {
@@ -1775,16 +1798,24 @@ class StockPredictor:
 
     def _analyze_risk_and_volatility(self, historical_df, pred_df):
         """分析风险和波动性"""
-        # 计算预测数据的波动性
         pred_returns = pred_df['close'].pct_change().dropna()
-        pred_volatility = pred_returns.std() * (252 ** 0.5)  # 年化波动率
 
-        # 计算历史数据的波动性作为对比
-        hist_returns = historical_df['close'].pct_change().dropna().tail(100)  # 最近100个点
+        # 预测点太少时使用历史波动率作为近似
+        hist_returns = historical_df['close'].pct_change().dropna().tail(100)
         hist_volatility = hist_returns.std() * (252 ** 0.5) if len(hist_returns) > 0 else 0
 
-        # 风险指标
-        var_95 = np.percentile(pred_returns, 5)  # 95% VaR
+        if len(pred_returns) < 2:
+            return {
+                'pred_volatility': 0,
+                'hist_volatility': hist_volatility,
+                'volatility_ratio': 0,
+                'var_95': 0,
+                'max_drawdown': 0,
+                'sharpe_ratio': 0
+            }
+
+        pred_volatility = pred_returns.std() * (252 ** 0.5)
+        var_95 = np.percentile(pred_returns, 5)
         max_drawdown = self._calculate_max_drawdown(pred_df['close'])
 
         return {
@@ -1799,19 +1830,23 @@ class StockPredictor:
     def _evaluate_prediction_quality(self, historical_df, pred_df, is_future_forecast):
         """评估预测质量"""
         quality_scores = {}
-
-        # 1. 平滑性评分 (0-1, 1表示非常平滑)
         returns = pred_df['close'].pct_change().dropna()
-        smoothness = 1 / (1 + returns.std())  # 波动率越低，平滑性越高
+
+        if len(returns) < 2:
+            quality_scores['smoothness'] = 1.0
+            quality_scores['reasonableness'] = 0.5
+            quality_scores['continuity'] = 1.0
+            quality_scores['overall_score'] = 0.83
+            return quality_scores
+
+        smoothness = 1 / (1 + returns.std())
         quality_scores['smoothness'] = smoothness
 
-        # 2. 合理性评分 (基于历史波动性)
         hist_volatility = historical_df['close'].pct_change().dropna().tail(50).std()
         pred_volatility = returns.std()
 
-        if hist_volatility > 0:
+        if hist_volatility > 0 and pred_volatility > 0:
             volatility_ratio = pred_volatility / hist_volatility
-            # 理想的波动率比应该在0.5-2.0之间
             if 0.5 <= volatility_ratio <= 2.0:
                 reasonableness = 1.0
             else:
@@ -1821,12 +1856,10 @@ class StockPredictor:
 
         quality_scores['reasonableness'] = reasonableness
 
-        # 3. 连续性评分 (检查是否有异常跳跃)
-        jumps = (returns.abs() > 0.1).sum()  # 单步变化超过10%的次数
+        jumps = (returns.abs() > 0.1).sum()
         continuity = max(0, 1 - jumps / len(returns))
         quality_scores['continuity'] = continuity
 
-        # 4. 整体质量评分
         quality_scores['overall_score'] = np.mean([smoothness, reasonableness, continuity])
 
         return quality_scores
@@ -1915,10 +1948,12 @@ class StockPredictor:
                 logger.error(f"历史数据验证失败: {error_msg}")
                 return None
 
-            # 验证输入数据
+            # 验证输入数据（预测输入的最小点数按实际lookback长度放宽）
             input_df = x_df.copy()
             input_df[self.data_config['timestamp_column']] = x_timestamp
-            is_valid, error_msg = self.validate_data(input_df, "input_data")
+            input_min_points = max(10, len(x_df))
+            is_valid, error_msg = self.validate_data(input_df, "input_data",
+                                                      min_points_override=input_min_points)
             if not is_valid:
                 logger.error(f"输入数据验证失败: {error_msg}")
                 return None
@@ -1939,8 +1974,12 @@ class StockPredictor:
                 enable_advanced=enable_advanced_preprocessing,
                 normalization=price_normalization,
                 trend_adjustment=trend_adjustment,
-                volatility_filter=volatility_filter
-            )[REQUIRED_COLUMNS]
+                volatility_filter=volatility_filter,
+                min_points_override=input_min_points
+            )
+            # 仅保留在输入中存在的必要列
+            valid_cols = [c for c in REQUIRED_COLUMNS if c in x_df.columns]
+            x_df = x_df[valid_cols]
 
             # 确保 y_timestamp 是正确的类型
             y_timestamp_series = pd.Series(pd.to_datetime(y_timestamp))
