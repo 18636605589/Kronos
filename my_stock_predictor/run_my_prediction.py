@@ -136,6 +136,11 @@ PREDICTION_CONFIG = {
     "plot_lookback_days": 30,       # 图表显示的历史天数 (显示完整回溯期)
     "enable_focus_mode": True,       # 启用专注模式，只显示预测相关区域
     "prediction_highlight": True,    # 高亮预测区域
+
+    # --- 滚动回测配置（--mode rolling）---
+    # 将历史数据按时间顺序切成 N 段，每段独立跑回测，取均值评估真实泛化性能
+    "rolling_windows": 5,            # 滚动窗口数量（建议 3-8，越多越可信但越慢）
+    "rolling_use_latest_ratio": 0.4, # 保留最近该比例的数据不用于 tune（作为验证集）
 }
 # ==============================================================================
 
@@ -749,30 +754,27 @@ class UnifiedPredictor:
         else:
             print(f"✅ 使用全部可用数据 ({len(df)} 条) 进行调优...")
         
-        # 2. 准备回测数据
-        # 注意：这里需要调整逻辑，因为我们现在使用更多的数据进行验证，而不仅仅是最后一段
-        # 但为了保持调优逻辑的一致性（预测最后一段），我们仍然使用最后一段作为验证集
-        # 这里的逻辑是：使用 df 的最后 required_total 长度作为输入来预测最后一段
-        # 如果 df 很长，前面的数据其实没有被用到预测里（因为模型只看 lookback_steps）
-        # 等等，调优的目的是测试参数在"当前"市场环境下的表现。
-        # 如果我们只跑一次预测（针对最后一段），那么前面的 20000 条数据其实没用上？
-        # 对！UnifiedPredictor.run_prediction_pipeline 内部是单次预测。
-        # 如果要利用更多数据，应该进行"滚动回测" (Rolling Backtest)，但这会非常慢。
-        # 鉴于用户说"多多益善"，可能误以为数据多就能跑得准。
-        # 但实际上，对于单次预测，只有最后 lookback_steps 条数据是有效的输入。
-        # 除非... 我们修改 run_prediction_pipeline 让它跑多次？
-        # 不，那太复杂了。
-        # 既然用户要求"数据最少5000"，我们至少保证了数据量充足。
-        # 现有的逻辑是：
-        # subset_df = df.tail(required_total)
-        # 这意味着它只用了最后 required_total 条。
-        # 如果用户想利用更多数据，应该是想看"过去一段时间的平均表现"？
-        # 但目前的架构不支持快速的滚动回测。
-        # 
-        # 让我们先按用户的要求裁剪数据。虽然对于单次预测来说，多余的数据可能没被直接用到，
-        # 但保留它们可以确保我们有足够的历史上下文（比如计算技术指标时）。
-        
-        subset_df = df.tail(required_total).reset_index(drop=True)
+        # 修复数据泄露：tune 应当使用过去的数据找参数，保留最新数据做验证
+        use_ratio = config.get('rolling_use_latest_ratio', 0.4)
+        if use_ratio >= 1.0 or use_ratio <= 0:
+            use_ratio = 0.4
+            
+        # 最少需要一个完整的回测窗口（lookback + pred）
+        # 我们把最新的一部分数据（如40%或至少一个预测窗口长度）切掉不给 tune 用
+        reserve_len_for_val = max(int(len(df) * use_ratio), pred_len_steps)
+        if len(df) - reserve_len_for_val < required_total:
+            print(f"⚠️ 数据总长度({len(df)})扣除验证集({reserve_len_for_val})后不足 required_total({required_total})")
+            print("   降级保护：仅切掉最后一个预测窗口作为防泄露隔离")
+            reserve_len_for_val = pred_len_steps
+
+        if len(df) - reserve_len_for_val < required_total:
+             print("❌ 数据极度匮乏，无法在防泄露前提下进行 tune，请增大 fallback_fetch_days。")
+             return
+
+        tune_df = df.iloc[:-reserve_len_for_val].reset_index(drop=True)
+        print(f"✂️ 为防数据泄露，保留最新 {reserve_len_for_val} 条数据仅作验证，本次 tune 使用前 {len(tune_df)} 条数据。")
+
+        subset_df = tune_df.tail(required_total).reset_index(drop=True)
         x_df = subset_df.iloc[:lookback_steps][['open', 'high', 'low', 'close', 'volume', 'amount']].copy()
         x_timestamp = subset_df.iloc[:lookback_steps]['timestamps'].copy()
         y_timestamp = subset_df.iloc[lookback_steps:lookback_steps+pred_len_steps]['timestamps'].copy()
@@ -915,15 +917,223 @@ class UnifiedPredictor:
         except ValueError:
             return max(required_points, 1)
 
+    def run_rolling_backtest(self, config):
+        """
+        滚动回测（Rolling Backtest）
+        将历史数据按时间顺序切分为 N 个窗口，每段独立跳回测，
+        最终联合所有窗口的 MAPE 和方向准确率平均来评估模型的真实泛化性能。
+        相比单窗口回测，结果更可靠。
+        """
+        import numpy as np
+        import json
+        import logging
+
+        print("="*60)
+        print("🔄 开始滚动回测（Rolling Backtest）...")
+        print("="*60)
+
+        period       = config.get('period', '60')
+        symbol       = config.get('symbol', '000001')
+        n_windows    = config.get('rolling_windows', 5)
+        T            = config.get('T', 0.9)
+        top_p        = config.get('top_p', 0.6)
+        sample_count = config.get('sample_count', 5)
+
+        lookback_steps = self._calculate_steps(config['lookback_duration'], period)
+        pred_len_steps = self._calculate_steps(config['pred_len_duration'], period)
+        if not lookback_steps or not pred_len_steps:
+            print("❌ 时间参数解析失败")
+            return
+
+        # 单个窗口所需点数
+        window_size = lookback_steps + pred_len_steps
+        # 总共需要的最少数据点数： N 个窗口排列
+        required_total = window_size * n_windows
+
+        # 获取数据
+        required_days = self._estimate_required_days(required_total, period)
+        df, _, _ = self.fetcher.get_stock_data(
+            symbol=symbol,
+            source=config.get('source', 'baostock'),
+            period=period,
+            min_fresh_days=config.get('min_data_freshness_days', 5),
+            fallback_days=max(config.get('fallback_fetch_days', 300), required_days + 30),
+            force_refetch=config.get('force_refetch', False)
+        )
+
+        if df is None or len(df) < window_size * 2:
+            print(f"❌ 数据不足，滚动回测需要至少 {window_size * 2} 个数据点")
+            print(f"   建议：增大 fallback_fetch_days 或减少 rolling_windows")
+            return
+
+        # 根据实际数据量自动调整窗口数
+        actual_n = min(n_windows, len(df) // window_size)
+        if actual_n < n_windows:
+            print(f"⚠️ 数据量不足 {n_windows} 个窗口，实际可用 {actual_n} 个窗口")
+        if actual_n < 2:
+            print("❌ 数据不足以运行最小滚动回测，请增加数据量")
+            return
+
+        print(f"   股票: {symbol} | 周期: {period} | 回港: {lookback_steps}点 | 预测: {pred_len_steps}点")
+        print(f"   实际可用窗口数: {actual_n} （共 {len(df)} 个数据点）")
+        print(f"   参数: T={T}, top_p={top_p}, sample_count={sample_count}")
+        print("-"*60)
+
+        results = []
+
+        for i in range(actual_n):
+            # 按时间顺序从历史早期到近期递推
+            start_idx = len(df) - window_size * (actual_n - i)
+            end_idx   = start_idx + window_size
+            slice_df  = df.iloc[start_idx:end_idx].reset_index(drop=True)
+
+            win_label = f"窗口{i+1}/{actual_n}"
+            ts_start  = slice_df['timestamps'].iloc[0]
+            ts_end    = slice_df['timestamps'].iloc[-1]
+            print(f"\n[{win_label}] {ts_start} → {ts_end}")
+
+            # 准备该窗口的训练集和验证集
+            x_df        = slice_df.iloc[:lookback_steps][['open', 'high', 'low', 'close', 'volume', 'amount']].copy()
+            x_timestamp = slice_df.iloc[:lookback_steps]['timestamps'].copy()
+            y_timestamp = slice_df.iloc[lookback_steps:]['timestamps'].copy()
+            ground_truth = slice_df.iloc[lookback_steps:][['open', 'high', 'low', 'close', 'volume', 'amount']].copy()
+            ground_truth.index = pd.to_datetime(y_timestamp.values)
+
+            # 初始化预测器并静默日志
+            predictor = StockPredictor()
+            predictor.logger.setLevel(logging.WARNING)
+
+            try:
+                pred_results = predictor.run_prediction_pipeline(
+                    historical_df=slice_df,
+                    x_df=x_df,
+                    x_timestamp=x_timestamp,
+                    y_timestamp=y_timestamp,
+                    is_future_forecast=False,
+                    symbol=symbol,
+                    pred_len=pred_len_steps,
+                    T=T,
+                    top_p=top_p,
+                    sample_count=sample_count,
+                    plot_lookback=lookback_steps,
+                    enable_advanced_preprocessing=config.get('enable_advanced_preprocessing', False),
+                    price_normalization=config.get('price_normalization', 'none'),
+                    trend_adjustment=config.get('trend_adjustment', False),
+                    volatility_filter=config.get('volatility_filter', False),
+                    config=config
+                )
+
+                if pred_results:
+                    pred_df = pred_results['prediction']
+                    true_close, pred_close = ground_truth['close'].align(pred_df['close'], join='inner')
+
+                    if len(true_close) == 0:
+                        print(f"  [{win_label}] 序列索引无重叠，跳过")
+                        continue
+
+                    # MAPE
+                    mape = float(np.mean(np.abs((true_close - pred_close) / true_close)) * 100)
+
+                    # 方向准确率（每个时间第一个点相对上一个点的涨跌方向）
+                    true_dir = (true_close.diff().dropna() > 0)
+                    pred_dir = (pred_close.diff().dropna() > 0)
+                    _, true_dir_a = true_dir.align(pred_dir, join='inner')
+                    dir_acc = float((true_dir == true_dir_a).mean() * 100) if len(true_dir) > 0 else 0.0
+
+                    results.append({
+                        'window': win_label,
+                        'start': str(ts_start),
+                        'end': str(ts_end),
+                        'mape': mape,
+                        'dir_acc': dir_acc
+                    })
+                    print(f"  MAPE: {mape:.2f}% | 方向准确率: {dir_acc:.1f}%")
+                else:
+                    print(f"  [{win_label}] 预测失败，跳过")
+
+            except Exception as e:
+                print(f"  [{win_label}] 错误: {e}")
+
+        # 汇总输出
+        print("\n" + "="*60)
+        print("📊 滚动回测综合结果")
+        print("="*60)
+
+        if not results:
+            print("❌ 没有成功运行的窗口，请检查数据量和参数。")
+            return
+
+        mapes   = [r['mape'] for r in results]
+        dir_accs = [r['dir_acc'] for r in results]
+        avg_mape    = float(np.mean(mapes))
+        avg_dir_acc = float(np.mean(dir_accs))
+        std_mape    = float(np.std(mapes))
+
+        print(f"   窗口数: {len(results)} | 每窗 {lookback_steps}回港 + {pred_len_steps}预测")
+        print(f"\n   平均 MAPE         : {avg_mape:.2f}% (标准差 {std_mape:.2f}%)")
+        print(f"   平均方向准确率   : {avg_dir_acc:.1f}%")
+
+        if avg_mape < 5:
+            grade = "✅ 优秀"
+        elif avg_mape < 10:
+            grade = "⚠️ 一般"
+        elif avg_mape < 20:
+            grade = "🟡 较差"
+        else:
+            grade = "❌ 差"
+        print(f"   整体评级         : {grade}")
+
+        if avg_dir_acc >= 55:
+            dir_grade = "✅ 有参考价値"
+        elif avg_dir_acc >= 50:
+            dir_grade = "⚠️ 接近随机"
+        else:
+            dir_grade = "❌ 不如招硬币"
+        print(f"   方向信号可信度 : {dir_grade}")
+
+        print("\n   各窗口详细:")
+        print(f"   {'#':>3}  {'MAPE':>8}  {'Dir%':>6}  时间结束")
+        for r in results:
+            print(f"   {r['window']:>3}  {r['mape']:>7.2f}%  {r['dir_acc']:>5.1f}%  {r['end']}")
+
+        # 保存报告
+        import json
+        timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+        report_dir = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            'prediction_results', symbol, 'rolling_backtest'
+        )
+        os.makedirs(report_dir, exist_ok=True)
+
+        summary = {
+            'symbol': symbol, 'period': period,
+            'n_windows': len(results), 'lookback_steps': lookback_steps, 'pred_len_steps': pred_len_steps,
+            'parameters': {'T': T, 'top_p': top_p, 'sample_count': sample_count},
+            'avg_mape': avg_mape, 'std_mape': std_mape, 'avg_dir_accuracy': avg_dir_acc,
+            'window_results': results, 'timestamp': timestamp_str
+        }
+        json_path = os.path.join(report_dir, f"rolling_report_{timestamp_str}.json")
+        with open(json_path, 'w', encoding='utf-8') as f:
+            json.dump(summary, f, indent=4, ensure_ascii=False)
+
+        results_df = pd.DataFrame(results)
+        csv_path = os.path.join(report_dir, f"rolling_results_{timestamp_str}.csv")
+        results_df.to_csv(csv_path, index=False)
+
+        print(f"\n📄 滚动回测报告已保存:")
+        print(f"   {json_path}")
+        print(f"   {csv_path}")
+        print("="*60)
+
 
 def parse_arguments():
     """解析命令行参数"""
     parser = argparse.ArgumentParser(description="Kronos 股票预测统一脚本")
     parser.add_argument(
         "--mode",
-        choices=["future", "backtest", "tune"],
+        choices=["future", "backtest", "tune", "rolling"],
         default="future",
-        help="选择执行模式: future=预测未来, backtest=历史回测, tune=自动参数调优"
+        help="选择执行模式: future=预测未来, backtest=历史回测, tune=自动参数调优, rolling=滚动回测(推荐)"
     )
     # 网络模式互斥组
     mode_group = parser.add_mutually_exclusive_group()
@@ -951,12 +1161,17 @@ if __name__ == "__main__":
     
     # 模式处理
     if args.mode == "tune":
-        # 调优模式强制为回测逻辑
         is_future_mode = False
         runtime_config["forecast_future"] = False
         mode_label = "🎛️ 自动参数调优模式"
         mode_desc = "自动寻找最佳 T 和 top_p 参数组合"
         result_folder = "tuning_results"
+    elif args.mode == "rolling":
+        is_future_mode = False
+        runtime_config["forecast_future"] = False
+        mode_label = "🔄 滚动回测模式"
+        mode_desc = "多窗口滚动验证，评估模型真实泛化能力"
+        result_folder = "rolling_backtest"
     else:
         is_future_mode = args.mode == "future"
         runtime_config["forecast_future"] = is_future_mode
@@ -982,18 +1197,19 @@ if __name__ == "__main__":
         else:
             print("🌐 启用在线模式: 智能检查更新，失败时使用本地缓存")
     else:
-        # 默认在线模式
         os.environ['KRONOS_OFFLINE_MODE'] = 'false'
 
     print("="*60)
     print(f"   {mode_label}")
     print(f"   {mode_desc}")
-    if args.mode != "tune":
+    if args.mode not in ("tune", "rolling"):
         print(f"   📁 结果将保存至: prediction_results/{runtime_config['symbol']}/{result_folder}/")
     print("="*60)
     
     predictor = UnifiedPredictor()
     if args.mode == "tune":
         predictor.run_tuning(runtime_config)
+    elif args.mode == "rolling":
+        predictor.run_rolling_backtest(runtime_config)
     else:
         predictor.run_prediction(runtime_config)
