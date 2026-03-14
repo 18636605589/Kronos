@@ -14,6 +14,7 @@
     python my_stock_predictor/run_my_prediction.py --mode tune     # 自动寻找最佳参数 (fun run_tuning)
     python my_stock_predictor/run_my_prediction.py --mode future   # 仅执行未来预测
     python my_stock_predictor/run_my_prediction.py --mode backtest  # 仅执行回测
+    python my_stock_predictor/run_my_prediction.py --mode rolling   # 仅执行滚动回测
 """
 
 import argparse
