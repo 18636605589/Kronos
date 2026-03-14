@@ -33,18 +33,21 @@ from constants import (
 
 class StockDataFetcher:
     """股票数据获取器"""
-    
+
     # 类变量：baostock 登录状态
     _baostock_logged_in = False
-    
-    def __init__(self, data_dir="my_stock_predictor/stock_data"):
+
+    # 默认数据目录使用绝对路径，避免依赖调用时的工作目录
+    _default_data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "stock_data")
+
+    def __init__(self, data_dir=None):
         """
         初始化数据获取器
-        
+
         Args:
-            data_dir (str): 数据保存目录
+            data_dir (str): 数据保存目录，默认为脚本同级的 stock_data/ 目录
         """
-        self.data_dir = data_dir
+        self.data_dir = data_dir or self._default_data_dir
         self.ensure_data_dir()
     
     @classmethod

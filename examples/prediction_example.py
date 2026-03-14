@@ -49,7 +49,11 @@ tokenizer = KronosTokenizer.from_pretrained("NeoQuasar/Kronos-Tokenizer-base")
 model = Kronos.from_pretrained("NeoQuasar/Kronos-small")
 
 # 2. Instantiate Predictor
+<<<<<<< HEAD
 predictor = KronosPredictor(model, tokenizer, device="cpu", max_context=512)
+=======
+predictor = KronosPredictor(model, tokenizer, max_context=512)
+>>>>>>> upstream/master
 
 # 3. Prepare Data
 df = pd.read_csv(os.path.join(current_dir, "data", "XSHG_5min_600977.csv"))

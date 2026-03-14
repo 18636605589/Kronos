@@ -11,10 +11,9 @@
 
 用法:
     python my_stock_predictor/run_my_prediction.py                # 默认预测未来
-    python my_stock_predictor/run_my_prediction.py --mode future
+    python my_stock_predictor/run_my_prediction.py --mode tune     # 自动寻找最佳参数 (fun run_tuning)
+    python my_stock_predictor/run_my_prediction.py --mode future   # 仅执行未来预测
     python my_stock_predictor/run_my_prediction.py --mode backtest  # 仅执行回测
-
-    python my_stock_predictor/run_my_prediction.py --mode tune 自动寻找最佳参数 (fun run_tuning)
 """
 
 import argparse
@@ -96,7 +95,7 @@ python
 
 PREDICTION_CONFIG = {
     # --- 股票信息 ---
-    "symbol": "300708",          # 股票代码 (例如: A股 '600519', 美股 'NVDA')
+    "symbol": "000876",          # 股票代码 (例如: A股 '600519', 美股 'NVDA')
     "source": "baostock",        # 数据源 ('baostock' for A股推荐, 'akshare' for A股备用, 'yfinance' for 美股/全球)
     
     # --- 数据获取时间范围 ---
@@ -105,26 +104,33 @@ PREDICTION_CONFIG = {
     "period": "60",             # 数据频率 ('5', '15', '30', '60' for 分钟, 'D' for 日线) - 切换为60分钟线
 
     # --- 预测参数 (使用带有单位的时间字符串) ---
-    "lookback_duration": "120d",   # 回溯时长 (单位: d=天, h=小时, M=月) - 120天约480个点，完美利用模型上下文(512)
+    # 回溯不宜过长：Kronos 内部用历史均值做 z-score，若股价涨跌幅度大，
+    # 过长回溯导致均值远离当前价位，预测会回归到偏低/偏高的历史均值。
+    # 60d 是通用默认值；对近期涨跌幅超 50% 的强趋势股可缩短到 30d。
+    "lookback_duration": "60d",    # 60天约240个点（通用默认值）
     "pred_len_duration": "5d",    # 预测时长 (单位: d=天, h=小时, M=月) - 预测未来5天 (约20个点)
 
-    # --- 模型高级参数 (MPS优化配置) ---
-    "T": 0.2,                  # 采样温度 (稍微给一点灵活性)
-    "top_p": 0.8,              # 核采样概率 (适度宽松，允许一定灵活性)
-    "sample_count": 5,          # 预测路径数量 (用户设备支持最大5，增加路径数可提高稳定性)
-    "enable_adaptive_tuning": False,  # 禁用自适应参数调优，使用我们设定的优化参数
+    # --- 模型采样参数 ---
+    # 以下参数由 tune 模式自动调优得出（--mode tune），最佳 MAPE=0.79%
+    # 更换股票后建议重新运行 tune 找到针对新股票的最佳参数
+    "T": 0.9,                      # 采样温度（tune 最佳结果）
+    "top_p": 0.6,                  # 核采样概率（tune 最佳结果）
+    "sample_count": 10,            # 预测路径数量：10路平均更稳定
+    "enable_adaptive_tuning": False,  # 禁用自适应调优，使用上面手动设定的参数
 
-    # --- 数据预处理增强 ---
-    "enable_advanced_preprocessing": True,  # 启用高级数据预处理
-    "price_normalization": "robust",       # 价格归一化方法: 'standard', 'robust', 'none'
-    "trend_adjustment": False,             # 禁用趋势调整 (直接预测价格，避免平滑过度)
-    "volatility_filter": True,             # 启用波动率过滤
+    # --- 数据预处理 ---
+    # Kronos 内部已处理尺度和分布，输入应尽量保持原始
+    # 过度预处理（IQR替换28%数据+波动率过滤+EWM平滑）是导致 MAPE 40% 的根因
+    "enable_advanced_preprocessing": False,  # 关闭高级预处理（归一化/趋势调整/波动率过滤）
+    "price_normalization": "none",           # 不做归一化
+    "trend_adjustment": False,               # 不做趋势调整
+    "volatility_filter": False,              # 关闭波动率过滤，避免破坏真实波动信息
 
     # --- 新增: 是否强制刷新 ---
     "force_refetch": False,     # 设置为 True 可忽略本地缓存，强制从网络获取最新数据
     # --- 数据新鲜度控制 ---
     "min_data_freshness_days": 5,   # 允许的最大数据滞后天数
-    "fallback_fetch_days": 150,     # 当数据过旧时重新拉取的时间范围(天数) - 调整为150天以覆盖120天回溯
+    "fallback_fetch_days": 300,     # 增加到300天，确保获取足够的历史数据
     
     # --- 图表显示优化 ---
     "plot_lookback_days": 30,       # 图表显示的历史天数 (显示完整回溯期)
@@ -345,7 +351,8 @@ class UnifiedPredictor:
             print("   - ✅ 未来预测模式")
 
         # 智能裁剪数据（保留足够的历史数据）
-        min_required = max(required_total, 5000)  # 至少保留5000点或所需点数
+        # 只需要 required_total 条数据即可完成预测/回测，无需 5000 这种固定下限
+        min_required = required_total
         if original_rows > min_required:
             # 对于未来预测，保留最新的数据
             if is_future_mode:
@@ -505,16 +512,36 @@ class UnifiedPredictor:
 
     def _generate_future_timestamps(self, last_timestamp, steps, period):
         """
-        生成未来的交易时间戳 (重写以修复bug)。
+        生成未来的 A 股交易时间戳。
+        优先使用 chinese_calendar 库跳过法定节假日（春节/五一/国庆等），
+        未安装时自动降级为普通工作日逻辑。
         """
-        from pandas.tseries.offsets import BDay
-        
+        # 尝试导入中国节假日库
+        try:
+            import chinese_calendar
+            def _is_trading_day(dt):
+                """判断是否为 A 股交易日（工作日 + 非法定节假日）"""
+                return chinese_calendar.is_workday(dt.date())
+            _calendar_source = "chinese_calendar（含法定节假日）"
+        except ImportError:
+            def _is_trading_day(dt):
+                return dt.weekday() < 5
+            _calendar_source = "普通工作日（未安装 chinese_calendar）"
+            print(f"⚠️ 未检测到 chinese_calendar 库，使用{_calendar_source}。\n"
+                  "   建议安装: pip install chinesecalendar")
+
+        print(f"   - 交易日历: {_calendar_source}")
         timestamps = []
         current_time = pd.to_datetime(last_timestamp)
-        
+
         if period == 'D':
-            future_days = pd.date_range(start=current_time + BDay(), periods=steps, freq=BDay())
-            return future_days
+            # 日线：逐天检查，跳过非交易日
+            candidate = current_time + timedelta(days=1)
+            while len(timestamps) < steps:
+                if _is_trading_day(candidate):
+                    timestamps.append(pd.Timestamp(candidate.date()))
+                candidate += timedelta(days=1)
+            return pd.to_datetime(timestamps)
 
         try:
             minutes_per_step = int(period)
@@ -526,19 +553,20 @@ class UnifiedPredictor:
             # 1. 时间递增
             current_time += timedelta(minutes=minutes_per_step)
 
-            # 2. 检查是否需要跳到下一天
-            # 如果当前时间超过下午3点，或者进入了新的一天
+            # 2. 超过收盘（15:00）或跨天，跳到下一个 A 股交易日开盘
             last_date = timestamps[-1].date() if timestamps else last_timestamp.date()
             if current_time.time() > datetime.strptime("15:00", "%H:%M").time() or \
                current_time.date() > last_date:
-                
-                # 计算下一个交易日
-                next_day = pd.to_datetime(current_time.date())
-                if current_time.weekday() >= 4 or current_time.time() > datetime.strptime("15:00", "%H:%M").time(): # 周五或周末，或当天收盘后
-                    next_day = next_day + BDay()
-                
-                # 重置到下一个交易日的开盘时间
-                current_time = next_day.replace(hour=9, minute=30, second=0, microsecond=0)
+
+                # 找到下一个交易日（跳过周末和法定节假日）
+                next_day = pd.Timestamp(current_time.date()) + timedelta(days=1)
+                while not _is_trading_day(next_day):
+                    next_day += timedelta(days=1)
+
+                # 重置到开盘时间
+                current_time = next_day.to_pydatetime().replace(
+                    hour=9, minute=30, second=0, microsecond=0
+                )
 
             # 3. 处理午休 (11:30 -> 13:00)
             if datetime.strptime("11:30", "%H:%M").time() < current_time.time() < datetime.strptime("13:00", "%H:%M").time():
@@ -551,7 +579,7 @@ class UnifiedPredictor:
 
             if is_morning or is_afternoon:
                 timestamps.append(current_time)
-        
+
         return pd.to_datetime(timestamps)
 
     def _validate_prediction_results(self, results, config, ground_truth=None):
@@ -708,13 +736,9 @@ class UnifiedPredictor:
             print(f"❌ 未能获取到数据，无法进行调优。")
             return
 
-        # 检查数据量是否满足用户要求的最低标准 (5000)
-        if len(df) < 5000:
-            print(f"❌ 数据量不足 ({len(df)})，用户要求最少 5000 条。请尝试获取更多历史数据。")
-            return
-
+        # 检查数据量是否满足预测所需的最低要求（lookback + pred_len）
         if len(df) < required_total:
-            print(f"❌ 数据不足，无法进行调优 (需要 {required_total}，实际 {len(df)})")
+            print(f"❌ 数据量不足 ({len(df)})，调优所需最少 {required_total} 条。请尝试增加 fallback_fetch_days 或缩短 lookback_duration。")
             return
 
         # 裁剪数据: 最多保留 30000 条 (多多益善，但有上限)
@@ -813,10 +837,14 @@ class UnifiedPredictor:
                     
                     if pred_results:
                         pred_df = pred_results['prediction']
-                        # 计算MAPE
+                        # 显式对齐索引，避免时间戳错位导致 MAPE 计算出 NaN
                         true_close = ground_truth['close']
                         pred_close = pred_df['close']
-                        mape = np.mean(np.abs((true_close - pred_close) / true_close)) * 100
+                        true_close_aligned, pred_close_aligned = true_close.align(pred_close, join='inner')
+                        if len(true_close_aligned) == 0:
+                            print(f"{T:<6.1f} | {top_p:<6.1f} | {'NoOverlap':<10} | ❌")
+                            continue
+                        mape = np.mean(np.abs((true_close_aligned - pred_close_aligned) / true_close_aligned)) * 100
                         
                         results.append({'T': T, 'top_p': top_p, 'mape': mape})
                         print(f"{T:<6.1f} | {top_p:<6.1f} | {mape:<9.2f}% | ✅")

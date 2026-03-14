@@ -325,8 +325,9 @@ class StockPredictor:
                         processed_df[col] = processed_df[col].fillna(median_val)
                         logger.warning(f"列 {col} 使用中位数 {median_val:.2f} 填充剩余NaN值")
 
-            # 2. 异常值检测和处理
-            if detect_outliers:
+            # 2. 异常值检测和处理（仅在启用高级预处理时执行）
+            # Kronos 基础模型对原始数据表现更好，IQR 检测容易误删正常股价
+            if enable_advanced and detect_outliers:
                 processed_df = self._handle_outliers(processed_df)
 
             # 3. 高级预处理（可选）
@@ -335,8 +336,10 @@ class StockPredictor:
                     processed_df, normalization, trend_adjustment, volatility_filter
                 )
 
-            # 4. 添加数据平滑处理（优化措施）
-            processed_df = self._smooth_price_data(processed_df)
+            # 4. 数据平滑处理（仅在启用高级预处理时执行）
+            # 平滑会引入滞后，对基础模型预测产生系统性偏差
+            if enable_advanced:
+                processed_df = self._smooth_price_data(processed_df)
 
             # 5. 确保数据类型正确
             processed_df[TIMESTAMP_COLUMN] = pd.to_datetime(processed_df[TIMESTAMP_COLUMN])
@@ -434,26 +437,30 @@ class StockPredictor:
             adjusted_df[col] = df[col] - trend + trend.mean()
 
         logger.info("已应用趋势调整")
-        return adjusted_df.fillna(method='bfill').fillna(method='ffill')
+        # 使用新版 pandas API，避免废弃告警
+        return adjusted_df.bfill().ffill()
 
     def _filter_volatility(self, df: pd.DataFrame) -> pd.DataFrame:
-        """波动率过滤 - 减少高波动期的影响"""
+        """波动率过滤 - 高波动区间用移动平均平滑，降低噪声对模型的干扰"""
         filtered_df = df.copy()
 
-        # 计算滚动波动率
+        # 计算滚动波动率（20周期）
         returns = df['close'].pct_change()
         volatility = returns.rolling(window=20).std()
 
-        # 高波动期权重降低
+        # 高波动期权重降低（权重越低，越依赖移动平均）
         volatility_threshold = volatility.quantile(0.8)  # 80分位数
         weights = 1 / (1 + volatility / volatility_threshold)
+        # 避免 NaN 权重（序列开头）
+        weights = weights.fillna(1.0)
 
-        # 应用权重到价格数据
+        # 高波动区间用移动平均替代原始数据（修复原恒等变换 bug）
         for col in PRICE_COLUMNS:
-            filtered_df[col] = df[col] * weights + df[col] * (1 - weights)
+            rolling_mean = df[col].rolling(window=20, center=True, min_periods=1).mean()
+            filtered_df[col] = df[col] * weights + rolling_mean * (1 - weights)
 
         logger.info("已应用波动率过滤")
-        return filtered_df.fillna(method='bfill').fillna(method='ffill')
+        return filtered_df.bfill().ffill()
     
     def _inverse_normalization(self, df: pd.DataFrame) -> pd.DataFrame:
         """
@@ -496,17 +503,20 @@ class StockPredictor:
 
     def _smooth_price_data(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        对价格数据进行平滑处理，减少噪声，提高预测稳定性
+        对价格数据进行轻微平滑，减少噪声，提高预测稳定性。
+        使用 adjust=False（纯因果递推），避免使用未来数据（前瞻偏差）。
+        alpha=0.3 在平滑和响应速度之间取得更好平衡（原 0.1 滞后过强）。
         """
         smoothed_df = df.copy()
         price_cols = ['open', 'high', 'low', 'close']
 
         for col in price_cols:
             if col in smoothed_df.columns:
-                # 使用指数移动平均进行轻微平滑（alpha=0.1，避免数据泄露）
-                smoothed_df[col] = smoothed_df[col].ewm(alpha=0.1, adjust=True).mean()
+                # adjust=False: 纯因果递推，不使用未来数据
+                # alpha=0.3: 减小历史滞后，使最近价格权重更高
+                smoothed_df[col] = smoothed_df[col].ewm(alpha=0.3, adjust=False).mean()
 
-        logger.info("已应用数据平滑处理以提高预测稳定性")
+        logger.info("已应用数据平滑处理（因果EWM，alpha=0.3）")
         return smoothed_df
 
     def _handle_outliers(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -522,9 +532,9 @@ class StockPredictor:
             Q3 = processed_df[col].quantile(0.75)
             IQR = Q3 - Q1
 
-            # IQR异常值检测：低于Q1-1.5*IQR或高于Q3+1.5*IQR的值
-            lower_bound = Q1 - 1.5 * IQR
-            upper_bound = Q3 + 1.5 * IQR
+            # IQR异常值检测：A股涨跌停属于正常行为，阈值从1.5放宽到2.5
+            lower_bound = Q1 - 2.5 * IQR
+            upper_bound = Q3 + 2.5 * IQR
 
             outlier_mask = (processed_df[col] < lower_bound) | (processed_df[col] > upper_bound)
 
@@ -1105,6 +1115,47 @@ class StockPredictor:
             processed_df['volume'] = processed_df['volume'].clip(lower=0)
         if 'amount' in processed_df.columns:
             processed_df['amount'] = processed_df['amount'].clip(lower=0)
+
+        # 4. A股涨跌停价格约束（–10%/日，防止预测超出交易规则上限）
+        try:
+            last_close = float(x_df['close'].iloc[-1])
+            if last_close > 0 and len(pred_df.index) >= 1:
+                # 从预测时间戳推断数据频率
+                if len(processed_df.index) >= 2:
+                    step_minutes = (processed_df.index[1] - processed_df.index[0]).total_seconds() / 60
+                else:
+                    step_minutes = 60
+
+                if step_minutes >= 1440:
+                    # 日线：逐步滚动约束 ±10%/天
+                    per_step_limit = 0.10
+                    for col in ['open', 'high', 'low', 'close']:
+                        if col not in processed_df.columns:
+                            continue
+                        prev_price = last_close
+                        clipped = []
+                        for val in processed_df[col]:
+                            v = float(val)
+                            v = min(v, prev_price * (1 + per_step_limit))
+                            v = max(v, prev_price * (1 - per_step_limit))
+                            clipped.append(v)
+                            prev_price = v  # 下一步以当前预测价为基准
+                        processed_df[col] = clipped
+                    logger.info("已应用日线涨跌停约束（逐日滚动 ±10%）")
+                else:
+                    # 分钟线：按预测总天数设置整体允许区间
+                    steps_per_day = max(1, 240 / step_minutes)
+                    num_trading_days = max(1, len(processed_df) / steps_per_day)
+                    total_limit = 0.10 * num_trading_days
+                    for col in ['open', 'high', 'low', 'close']:
+                        if col in processed_df.columns:
+                            processed_df[col] = processed_df[col].clip(
+                                lower=last_close * (1 - total_limit),
+                                upper=last_close * (1 + total_limit)
+                            )
+                    logger.info(f"已应用分钟线价格区间约束（预测{num_trading_days:.0f}交易日区间 ±{total_limit:.0%}）")
+        except Exception as e:
+            logger.warning(f"A股涨跌停约束应用失败（不影响预测结果）: {e}")
 
         return processed_df
 

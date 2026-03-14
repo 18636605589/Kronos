@@ -1,6 +1,6 @@
 numpy
 pandas
-torch
+torch>=2.0.0
 psutil>=5.9.0  # 可选，用于性能监控
 
 einops==0.8.1

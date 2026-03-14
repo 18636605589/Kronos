@@ -1,0 +1,86 @@
+{
+  "analysis": {
+    "symbol": "000876",
+    "historical_last_close": 8.87,
+    "prediction_period_days": 20,
+    "is_future_forecast": false,
+    "price_analysis": {
+      "mean": "8.793007",
+      "std": "0.038266808",
+      "min": "8.738822",
+      "max": "8.861309",
+      "median": "8.794945",
+      "q25": 8.759185552597046,
+      "q75": 8.817860126495361,
+      "range": "0.12248707",
+      "cv": "0.004351959",
+      "baseline_close": 8.87,
+      "pred_start": "8.861309",
+      "pred_end": "8.741784",
+      "price_change": -0.12821590423583906,
+      "price_change_percentage": -1.4455006114525262,
+      "trend": "下跌",
+      "trend_strength": "0.013488408",
+      "direction_consistency": "一致"
+    },
+    "volume_analysis": {
+      "mean": "6.1945365e+06",
+      "std": "3.5988108e+06",
+      "min": "3.615493e+06",
+      "max": "1.939726e+07",
+      "trend": "减少",
+      "volatility": "0.5809653"
+    },
+    "risk_analysis": {
+      "pred_volatility": "0.0126535185",
+      "hist_volatility": 0.08503996104717325,
+      "volatility_ratio": 0.14879497018022403,
+      "var_95": "-0.0019722818",
+      "max_drawdown": -0.013822683247386178,
+      "sharpe_ratio": "-0.895992"
+    },
+    "quality_metrics": {
+      "smoothness": "0.9992035",
+      "reasonableness": 0,
+      "continuity": 1.0,
+      "overall_score": 0.6664011677106222
+    },
+    "technical_analysis": {
+      "ma5": 8.744598960876464,
+      "ma10": 8.76052770614624,
+      "ma20": 8.793006420135498,
+      "macd": -0.02616796700356616,
+      "macd_signal": -0.018650654519709216,
+      "macd_hist": -0.007517312483856946,
+      "rsi": 5.962999478049056,
+      "trend_ma": "bearish",
+      "trend_macd": "bearish",
+      "trend_rsi": "oversold"
+    },
+    "timestamp": "2026-03-14T17:15:13.232249"
+  },
+  "plot_path": "/Users/zilong/Documents/Project/Python/Kronos/my_stock_predictor/tuning_results/000876/backtest/000876_backtest_chart_20260314_171513.png",
+  "parameters": {
+    "pred_len": 20,
+    "T": 0.7,
+    "top_p": 0.9,
+    "sample_count": 3,
+    "is_future_forecast": false
+  },
+  "data_quality": {
+    "input_points": 240,
+    "prediction_points": 20,
+    "processing_timestamp": "2026-03-14T17:15:13.446363"
+  },
+  "symbol": "000876",
+  "prediction_time": "20260314_171513",
+  "data_points": 20,
+  "columns": [
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+    "amount"
+  ]
+}
