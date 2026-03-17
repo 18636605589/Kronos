@@ -108,7 +108,7 @@ PREDICTION_CONFIG = {
     # 60d 是通用默认值；对近期涨跌幅超 50% 的强趋势股可缩短到 30d。
     "lookback_duration": "60d",    # 60天约60个点（日线模式）
     # 1d 约4-8个点（更短的预测长度更能抵御均值回归的误差，提升真实胜率）
-    "pred_len_duration": "1d",    # 预测时长 (单位: d=天, h=小时, M=月) - 预测未来1天
+    "pred_len_duration": "3d",    # 预测时长 (单位: d=天, h=小时, M=月) - 预测未来3天
 
     # --- 数据降维 (实验性) ---
     # 如果开启，模型在预处理时只保留 'close' 价格列，移除高开低和成交量等特征
@@ -116,10 +116,10 @@ PREDICTION_CONFIG = {
     "use_close_only": False,
 
     # --- 模型采样参数 ---
-    # 以下参数由 tune 模式自动调优得出（--mode tune），最佳 MAPE=0.79%
+    # 以下参数由 tune 模式自动调优得出（--mode tune），基于前复权数据最佳 MAPE=0.11%
     # 更换股票后建议重新运行 tune 找到针对新股票的最佳参数
-    "T": 0.9,                      # 采样温度（tune 最佳结果）
-    "top_p": 0.6,                  # 核采样概率（tune 最佳结果）
+    "T": 0.7,                      # 采样温度（tune 最佳结果）
+    "top_p": 0.95,                 # 核采样概率（tune 最佳结果）
     "sample_count": 10,            # 预测路径数量：10路平均更稳定
     "enable_adaptive_tuning": False,  # 禁用自适应调优，使用上面手动设定的参数
 
@@ -277,12 +277,6 @@ class UnifiedPredictor:
                 print(f"❌ 数据量不足: 实际{actual}条, 需要{minimum_points_needed}条")
                 print("🔧 建议: 减少 lookback_duration/pred_len_duration 或使用更粗的时间粒度")
                 return
-
-        # 回测模式下如果数据不够完整回测，自动切换为未来预测
-        if not is_future_mode and len(df) < required_points_total:
-            print(f"⚠️ 数据点({len(df)})不足以完整回测({required_points_total})，自动切换到未来预测模式")
-            is_future_mode = True
-            config["forecast_future"] = True
 
         print(f"✅ 数据获取成功: {len(df)} 条数据")
         if filepath:
@@ -592,7 +586,8 @@ class UnifiedPredictor:
                 print("   ⚠️ 警告: 回测模式但未提供真实数据，只能进行合理性验证")
                 self._validate_reasonability(pred_df, analysis)
             else:
-                self._validate_backtest_accuracy(pred_df, ground_truth)
+                hist_last = analysis.get('historical_last_close') if analysis else None
+                self._validate_backtest_accuracy(pred_df, ground_truth, historical_last_close=hist_last)
         
         print("="*60)
     
@@ -628,36 +623,38 @@ class UnifiedPredictor:
             print(f"   ✅ 预测结果在合理范围内 (偏差: {deviation_percentage:.1f}%)")
 
         # 检查预测的波动性是否合理
-        volatility_ratio = pred_std / pred_mean
+        volatility_ratio = pred_std / pred_mean if pred_mean != 0 else 0
         if volatility_ratio > 0.1:  # 如果波动率超过10%
             print(f"   ⚠️ 注意: 预测波动较大 (波动率: {volatility_ratio:.1%})")
             print("   可能需要降低采样参数以获得更稳定的预测")
     
-    def _validate_backtest_accuracy(self, pred_df, ground_truth):
+    def _validate_backtest_accuracy(self, pred_df, ground_truth, historical_last_close=None):
         """计算回测准确性指标（与真实历史数据对比）"""
         import numpy as np
-        
-        # 确保索引对齐
-        pred_close = pred_df['close']
-        true_close = ground_truth['close']
-        
-        # 计算各种误差指标
-        # RMSE (Root Mean Squared Error) - 均方根误差
+
+        true_close, pred_close = ground_truth['close'].align(pred_df['close'], join='inner')
+        if len(true_close) == 0:
+            print("⚠️ 预测与真实数据索引无交集，无法计算回测指标")
+            return
+
         rmse = np.sqrt(np.mean((true_close - pred_close) ** 2))
-        
-        # MAE (Mean Absolute Error) - 平均绝对误差
         mae = np.mean(np.abs(true_close - pred_close))
-        
-        # MAPE (Mean Absolute Percentage Error) - 平均绝对百分比误差
         mape = np.mean(np.abs((true_close - pred_close) / true_close)) * 100
-        
-        # 方向准确率（预测涨跌方向的准确性）
-        true_diff = true_close.diff().dropna()
-        pred_diff = pred_close.diff().dropna()
-        if len(true_diff) > 0 and len(pred_diff) > 0:
-            true_direction = np.sign(true_diff)
-            pred_direction = np.sign(pred_diff)
-            direction_accuracy = np.mean(true_direction == pred_direction) * 100
+
+        # 方向准确率：多点用 diff，单点用与历史最后收盘价比较
+        if len(true_close) >= 2:
+            true_diff = true_close.diff().dropna()
+            pred_diff = pred_close.diff().dropna()
+            if len(true_diff) > 0 and len(pred_diff) > 0:
+                td_a, pd_a = np.sign(true_diff).align(np.sign(pred_diff), join='inner')
+                direction_accuracy = np.mean(td_a == pd_a) * 100 if len(td_a) > 0 else 0.0
+            else:
+                direction_accuracy = 0.0
+        elif historical_last_close is not None and len(true_close) == 1:
+            # 单点预测：与入场价（历史最后收盘价）比较涨跌方向
+            true_dir = 1 if true_close.iloc[0] > historical_last_close else -1
+            pred_dir = 1 if pred_close.iloc[0] > historical_last_close else -1
+            direction_accuracy = 100.0 if true_dir == pred_dir else 0.0
         else:
             direction_accuracy = 0.0
         
@@ -761,7 +758,10 @@ class UnifiedPredictor:
         print(f"✂️ 为防数据泄露，保留最新 {reserve_len_for_val} 条数据仅作验证，本次 tune 使用前 {len(tune_df)} 条数据。")
 
         subset_df = tune_df.tail(required_total).reset_index(drop=True)
-        x_df = subset_df.iloc[:lookback_steps][['open', 'high', 'low', 'close', 'volume', 'amount']].copy()
+        if config.get('use_close_only', False):
+            x_df = subset_df.iloc[:lookback_steps][['close']].copy()
+        else:
+            x_df = subset_df.iloc[:lookback_steps][['open', 'high', 'low', 'close', 'volume', 'amount']].copy()
         x_timestamp = subset_df.iloc[:lookback_steps]['timestamps'].copy()
         y_timestamp = subset_df.iloc[lookback_steps:lookback_steps+pred_len_steps]['timestamps'].copy()
         ground_truth = subset_df.iloc[lookback_steps:lookback_steps+pred_len_steps][['open', 'high', 'low', 'close', 'volume', 'amount']].copy()
@@ -803,16 +803,16 @@ class UnifiedPredictor:
                     predictor.logger.setLevel(logging.WARNING)
                     
                     pred_results = predictor.run_prediction_pipeline(
-                        historical_df=df,
+                        historical_df=tune_df,
                         x_df=x_df,
                         x_timestamp=x_timestamp,
                         y_timestamp=y_timestamp,
-                        is_future_forecast=False, # 必须是回测模式
+                        is_future_forecast=False,
                         symbol=config['symbol'],
                         pred_len=pred_len_steps,
                         T=T,
                         top_p=top_p,
-                        sample_count=3, # 调优时使用较少的采样数以加快速度
+                        sample_count=3,
                         plot_lookback=lookback_steps,
                         enable_advanced_preprocessing=config.get('enable_advanced_preprocessing', False),
                         price_normalization=config.get('price_normalization', 'none'),
@@ -887,21 +887,23 @@ class UnifiedPredictor:
             print("="*60)
 
     def _estimate_required_days(self, required_points, period):
-        """根据周期估算需要的最少交易日数"""
+        """根据周期估算需要的最少日历天数（非交易日数）"""
         if required_points <= 0:
             return 1
 
         if period == 'D':
-            return max(required_points, 1)
+            # 交易日 -> 日历天：除以交易日占比
+            return max(math.ceil(required_points / TRADING_DAYS_RATIO), 1)
 
         try:
-            minutes_per_step = int(period)
+            minutes_per_step = int(str(period).rstrip('mMhHdD'))
             if minutes_per_step <= 0:
                 raise ValueError
             steps_per_day = max(TRADING_MINUTES_PER_DAY // minutes_per_step, 1)
-            return max(math.ceil(required_points / steps_per_day), 1)
+            trading_days = math.ceil(required_points / steps_per_day)
+            return max(math.ceil(trading_days / TRADING_DAYS_RATIO), 1)
         except ValueError:
-            return max(required_points, 1)
+            return max(math.ceil(required_points / TRADING_DAYS_RATIO), 1)
 
     def run_rolling_backtest(self, config):
         """
@@ -918,7 +920,7 @@ class UnifiedPredictor:
         print("🔄 开始滚动回测（Rolling Backtest）...")
         print("="*60)
 
-        period       = config.get('period', '60')
+        period       = config.get('period', 'D')
         symbol       = config.get('symbol', '000001')
         n_windows    = config.get('rolling_windows', 5)
         T            = config.get('T', 0.9)
@@ -936,12 +938,17 @@ class UnifiedPredictor:
         # 总共需要的最少数据点数： N 个窗口排列
         required_total = window_size * n_windows
 
-        # 获取数据
+        # yfinance period 格式适配
+        fetch_period = period
+        if config.get('source', 'baostock') == 'yfinance':
+            from constants import PERIOD_MAP
+            fetch_period = PERIOD_MAP.get(period, '1d')
+
         required_days = self._estimate_required_days(required_total, period)
         df, _, _ = self.fetcher.get_stock_data(
             symbol=symbol,
             source=config.get('source', 'baostock'),
-            period=period,
+            period=fetch_period,
             min_fresh_days=config.get('min_data_freshness_days', 5),
             fallback_days=max(config.get('fallback_fetch_days', 300), required_days + 30),
             force_refetch=config.get('force_refetch', False)
@@ -983,8 +990,16 @@ class UnifiedPredictor:
 
         results = []
 
+        # 循环外创建一次预测器，避免模型重复加载
+        rolling_results_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "prediction_results")
+        predictor = StockPredictor(
+            device=os.environ.get('DEVICE', 'auto'),
+            results_dir=rolling_results_dir,
+            enable_adaptive_tuning=config.get('enable_adaptive_tuning', True)
+        )
+        predictor.logger.setLevel(logging.WARNING)
+
         for i in range(actual_n):
-            # 按时间顺序从历史早期到近期递推
             start_idx = len(df) - window_size * (actual_n - i)
             end_idx   = start_idx + window_size
             slice_df  = df.iloc[start_idx:end_idx].reset_index(drop=True)
@@ -994,7 +1009,6 @@ class UnifiedPredictor:
             ts_end    = slice_df['timestamps'].iloc[-1]
             print(f"\n[{win_label}] {ts_start} → {ts_end}")
 
-            # 准备该窗口的训练集和验证集
             if config.get('use_close_only', False):
                 x_df = slice_df.iloc[:lookback_steps][['close']].copy()
             else:
@@ -1004,13 +1018,14 @@ class UnifiedPredictor:
             ground_truth = slice_df.iloc[lookback_steps:][['open', 'high', 'low', 'close', 'volume', 'amount']].copy()
             ground_truth.index = pd.to_datetime(y_timestamp.values)
 
-            # 初始化预测器并静默日志
-            predictor = StockPredictor()
-            predictor.logger.setLevel(logging.WARNING)
+            # historical_df 需要足够多的点通过 validate_data，取该窗口结尾前的全量数据
+            hist_end = end_idx
+            hist_start = max(0, hist_end - max(window_size, 120))
+            historical_df = df.iloc[hist_start:hist_end].reset_index(drop=True)
 
             try:
                 pred_results = predictor.run_prediction_pipeline(
-                    historical_df=slice_df,
+                    historical_df=historical_df,
                     x_df=x_df,
                     x_timestamp=x_timestamp,
                     y_timestamp=y_timestamp,
@@ -1042,8 +1057,8 @@ class UnifiedPredictor:
                     # 方向准确率（每个时间第一个点相对上一个点的涨跌方向）
                     true_dir = (true_close.diff().dropna() > 0)
                     pred_dir = (pred_close.diff().dropna() > 0)
-                    _, true_dir_a = true_dir.align(pred_dir, join='inner')
-                    dir_acc = float((true_dir == true_dir_a).mean() * 100) if len(true_dir) > 0 else 0.0
+                    true_dir_a, pred_dir_a = true_dir.align(pred_dir, join='inner')
+                    dir_acc = float((true_dir_a == pred_dir_a).mean() * 100) if len(true_dir_a) > 0 else 0.0
 
                     results.append({
                         'window': win_label,

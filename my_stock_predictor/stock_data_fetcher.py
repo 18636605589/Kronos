@@ -359,7 +359,7 @@ class StockDataFetcher:
                     start_date=start_date,
                     end_date=end_date,
                     frequency=frequency,
-                    adjustflag="3"  # 前复权调整 (更常用)
+                    adjustflag="2"  # 前复权调整 (1=后复权, 2=前复权, 3=不复权)
                 )
 
                 if rs.error_code != '0':
@@ -568,6 +568,9 @@ class StockDataFetcher:
                             if min_fresh_days is not None:
                                 freshness_threshold = datetime.now() - timedelta(days=min_fresh_days)
                                 latest_timestamp = cached_df['timestamps'].max()
+                                # 统一为 naive datetime 以兼容 yfinance 等返回时区感知时间戳的数据源
+                                if hasattr(latest_timestamp, 'tzinfo') and latest_timestamp.tzinfo is not None:
+                                    latest_timestamp = latest_timestamp.tz_localize(None)
                                 if pd.isna(latest_timestamp) or latest_timestamp < freshness_threshold:
                                     refresh_needed = True
                                     stale_refresh_triggered = True
@@ -585,8 +588,10 @@ class StockDataFetcher:
                                 return cached_df, filepath, cached_metadata
                         else:
                             print("⚠️ 缓存数据文件不存在，准备重新获取。")
+                            refresh_needed = True
                     else:
                         print("⚠️ 缓存元数据不完整或数据文件丢失。")
+                        refresh_needed = True
             except Exception as e:
                 print(f"⚠️ 加载缓存失败: {e}")
 
@@ -649,7 +654,7 @@ class StockDataFetcher:
             if actual_rows < expected_rows * DATA_AMOUNT_CHECK_RATIO:
                 print(f"⚠️ 数据量不足: 实际{actual_rows}条，预期约{expected_rows}条，尝试分段拉取...")
                 print(f"   数据时间范围: {df['timestamps'].min()} 至 {df['timestamps'].max()}")
-                df = self._fetch_with_chunks(symbol, source, start_date, end_date, period, fallback_days)
+                df = self._fetch_with_chunks(symbol, source, query_start_date, query_end_date, period, fallback_days)
                 if df is None or df.empty:
                     print("❌ 分段拉取失败")
                     return None, None, None
@@ -662,7 +667,7 @@ class StockDataFetcher:
         # 额外检查：如果用户要求较长历史但数据仍然很少，强制分段拉取
         if fallback_days is not None and fallback_days >= 90 and len(df) < MIN_DATA_FOR_CHUNK:
             print(f"强制分段拉取: 请求{fallback_days}天数据但只有{len(df)}条，尝试获取更长历史...")
-            df = self._fetch_with_chunks(symbol, source, start_date, end_date, period, fallback_days)
+            df = self._fetch_with_chunks(symbol, source, query_start_date, query_end_date, period, fallback_days)
             if df is None or df.empty:
                 print("强制分段拉取失败")
                 return None, None, None

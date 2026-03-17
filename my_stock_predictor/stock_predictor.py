@@ -327,13 +327,15 @@ class StockPredictor:
 
             processed_df = df.copy()
 
-            # 1. 处理缺失值
+            # 1. 确保数值列类型正确（先于 NaN 填充，避免 coerce 产生的 NaN 被遗漏）
             numeric_cols = [c for c in REQUIRED_COLUMNS if c in processed_df.columns]
             for col in numeric_cols:
+                processed_df[col] = pd.to_numeric(processed_df[col], errors='coerce')
+
+            # 2. 处理缺失值
+            for col in numeric_cols:
                 if processed_df[col].isnull().any():
-                    # 使用前向填充，然后后向填充
                     processed_df[col] = processed_df[col].ffill().bfill()
-                    # 如果仍有NaN，使用中位数填充
                     if processed_df[col].isnull().any():
                         median_val = processed_df[col].median()
                         processed_df[col] = processed_df[col].fillna(median_val)
@@ -355,10 +357,8 @@ class StockPredictor:
             if enable_advanced:
                 processed_df = self._smooth_price_data(processed_df)
 
-            # 5. 确保数据类型正确
+            # 5. 确保时间戳类型正确
             processed_df[TIMESTAMP_COLUMN] = pd.to_datetime(processed_df[TIMESTAMP_COLUMN])
-            for col in numeric_cols:
-                processed_df[col] = pd.to_numeric(processed_df[col], errors='coerce')
 
             # 6. 排序数据
             processed_df = processed_df.sort_values(TIMESTAMP_COLUMN).reset_index(drop=True)
@@ -447,7 +447,7 @@ class StockPredictor:
 
         # 计算移动平均趋势
         for col in PRICE_COLUMNS:
-            trend = df[col].rolling(window=50, center=True).mean()
+            trend = df[col].rolling(window=50, center=False).mean()
             # 去除趋势成分
             adjusted_df[col] = df[col] - trend + trend.mean()
 
@@ -464,7 +464,7 @@ class StockPredictor:
         volatility = returns.rolling(window=20).std()
 
         # 高波动期权重降低（权重越低，越依赖移动平均）
-        volatility_threshold = volatility.quantile(0.8)  # 80分位数
+        volatility_threshold = max(volatility.quantile(0.8), 1e-10)
         weights = 1 / (1 + volatility / volatility_threshold)
         # 避免 NaN 权重（序列开头）
         weights = weights.fillna(1.0)
@@ -860,8 +860,9 @@ class StockPredictor:
                 if col in df.columns:
                     df[col] = pd.to_numeric(df[col], errors='coerce')
             
-            # 删除无效数据
-            df = df.dropna()
+            # 仅基于关键列删除无效行，避免因额外列 NaN 丢失有效数据
+            key_cols = [c for c in ['open', 'high', 'low', 'close', 'volume'] if c in df.columns]
+            df = df.dropna(subset=key_cols)
             
             # 按时间排序
             df = df.sort_values('timestamps').reset_index(drop=True)
@@ -943,7 +944,7 @@ class StockPredictor:
         
         return x_df, x_timestamp, y_timestamp, ground_truth
     
-    def predict(self, x_df, x_timestamp, y_timestamp, pred_len, T=0.3, top_p=0.8, sample_count=5):
+    def predict(self, x_df, x_timestamp, y_timestamp, pred_len, T=0.5, top_p=0.5, sample_count=1):
         """
         进行预测
         
@@ -1131,17 +1132,12 @@ class StockPredictor:
                         processed_df[col].rolling(window=3, center=True, min_periods=1).mean()
                     )
 
-        # 2. 确保OHLC关系合理
-        processed_df['high'] = processed_df[['open', 'close', 'high']].max(axis=1)
-        processed_df['low'] = processed_df[['open', 'close', 'low']].min(axis=1)
-
-        # 3. 确保成交量不为负数
         if 'volume' in processed_df.columns:
             processed_df['volume'] = processed_df['volume'].clip(lower=0)
         if 'amount' in processed_df.columns:
             processed_df['amount'] = processed_df['amount'].clip(lower=0)
 
-        # 4. A股涨跌停价格约束（–10%/日，防止预测超出交易规则上限）
+        # 3. A股涨跌停价格约束（–10%/日，防止预测超出交易规则上限）
         try:
             last_close = float(x_df['close'].iloc[-1])
             if last_close > 0 and len(pred_df.index) >= 1:
@@ -1181,6 +1177,11 @@ class StockPredictor:
                     logger.info(f"已应用分钟线价格区间约束（预测{num_trading_days:.0f}交易日区间 ±{total_limit:.0%}）")
         except Exception as e:
             logger.warning(f"A股涨跌停约束应用失败（不影响预测结果）: {e}")
+
+        # 4. 确保 OHLC 关系合理（放在涨跌停约束之后，保证最终一致性）
+        if all(c in processed_df.columns for c in ['open', 'high', 'low', 'close']):
+            processed_df['high'] = processed_df[['open', 'close', 'high']].max(axis=1)
+            processed_df['low'] = processed_df[['open', 'close', 'low']].min(axis=1)
 
         return processed_df
 
@@ -1427,25 +1428,10 @@ class StockPredictor:
             current_time = pd.Timestamp.now()
             pred_start_time = pred_df.index.min()
 
-            # 用单条分隔线标记预测起始，避免两条线+两个标签重叠
+            # 用单条分隔线标记预测起始
             ax1.axvline(pred_start_time, color='orange', linestyle='--', linewidth=1.5, alpha=0.8)
 
-            # 标记标签放在图表上方坐标系内，使用 transform 精确定位避免重叠
-            y_top = ax1.get_ylim()[1]
-            y_bottom = ax1.get_ylim()[0]
-            y_range = y_top - y_bottom
-            ax1.text(pred_start_time, y_top - y_range * 0.02, '预测开始',
-                    ha='right', va='top', fontsize=9,
-                    bbox=dict(boxstyle='round,pad=0.2', facecolor='orange', alpha=0.7))
-
-            if is_future_forecast and abs(current_time - all_timestamps.max()) < pd.Timedelta(days=7):
-                ax1.axvline(current_time, color='purple', linestyle=':', linewidth=1.5, alpha=0.7)
-                ax1.text(current_time, y_top - y_range * 0.12, '当前时间',
-                        ha='center', va='top', fontsize=9,
-                        bbox=dict(boxstyle='round,pad=0.2', facecolor='purple', alpha=0.7),
-                        color='white')
-            
-            # 自动调整Y轴范围，确保价格显示清晰
+            # 先设置 Y 轴范围，再定位文本标签
             all_prices = pd.concat([
                 plot_hist_df['close'],
                 pred_df['close']
@@ -1457,9 +1443,20 @@ class StockPredictor:
             price_min, price_max = all_prices.min(), all_prices.max()
             price_range = price_max - price_min
             if price_range > 0:
-                # 添加10%的边距
                 margin = price_range * 0.1
                 ax1.set_ylim(price_min - margin, price_max + margin)
+
+            # Y 轴确定后再放置标签（使用 transAxes 相对坐标避免坐标系不一致）
+            ax1.text(pred_start_time, ax1.get_ylim()[1] - (ax1.get_ylim()[1] - ax1.get_ylim()[0]) * 0.02,
+                    '预测开始', ha='right', va='top', fontsize=9,
+                    bbox=dict(boxstyle='round,pad=0.2', facecolor='orange', alpha=0.7))
+
+            if is_future_forecast and abs(current_time - all_timestamps.max()) < pd.Timedelta(days=7):
+                ax1.axvline(current_time, color='purple', linestyle=':', linewidth=1.5, alpha=0.7)
+                ax1.text(current_time, ax1.get_ylim()[1] - (ax1.get_ylim()[1] - ax1.get_ylim()[0]) * 0.12,
+                        '当前时间', ha='center', va='top', fontsize=9,
+                        bbox=dict(boxstyle='round,pad=0.2', facecolor='purple', alpha=0.7),
+                        color='white')
 
             ax1.set_ylabel('价格', fontsize=14)
             mode_name = '未来预测' if is_future_forecast else '历史回测'
@@ -1468,30 +1465,34 @@ class StockPredictor:
 
             ax1.set_title(f'{symbol} 股票{mode_name}结果 - 智能时间轴', fontsize=16)
 
-            # 在图表左上角添加模式标识框
             ax1.text(0.02, 0.98, f'{mode_name}\n{mode_desc}',
                     transform=ax1.transAxes, fontsize=11, verticalalignment='top',
                     bbox=dict(boxstyle='round,pad=0.5', facecolor=mode_color, alpha=0.8),
                     color='white', fontweight='bold')
 
-            ax1.legend(loc='upper left', fontsize=12)
+            ax1.legend(loc='upper center', fontsize=10)
             ax1.grid(True, alpha=0.3)
             
             # --- 成交量图 ---
-            ax2.plot(plot_hist_df['timestamps'], plot_hist_df['volume'], label='历史成交量', color='blue', linewidth=1.5)
-            vol_marker = 'o' if is_short_pred else None
-            vol_ms = 8 if is_short_pred else 4
-            ax2.plot(pred_df.index, pred_df['volume'], label='预测成交量',
-                    color='red', linewidth=2, linestyle='--',
-                    marker=vol_marker, markersize=vol_ms, zorder=5)
+            has_volume = 'volume' in plot_hist_df.columns and 'volume' in pred_df.columns
+            if has_volume:
+                ax2.plot(plot_hist_df['timestamps'], plot_hist_df['volume'], label='历史成交量', color='blue', linewidth=1.5)
+                vol_marker = 'o' if is_short_pred else None
+                vol_ms = 8 if is_short_pred else 4
+                ax2.plot(pred_df.index, pred_df['volume'], label='预测成交量',
+                        color='red', linewidth=2, linestyle='--',
+                        marker=vol_marker, markersize=vol_ms, zorder=5)
 
-            if not is_future_forecast:
-                true_values_df = historical_df[historical_df['timestamps'].isin(pred_df.index)]
-                if not true_values_df.empty:
-                    ax2.plot(true_values_df['timestamps'], true_values_df['volume'], label='真实成交量',
-                            color='green', linewidth=2, alpha=0.8,
-                            marker='s' if is_short_pred else None,
-                            markersize=vol_ms, zorder=5)
+                if not is_future_forecast:
+                    true_values_df = historical_df[historical_df['timestamps'].isin(pred_df.index)]
+                    if not true_values_df.empty and 'volume' in true_values_df.columns:
+                        ax2.plot(true_values_df['timestamps'], true_values_df['volume'], label='真实成交量',
+                                color='green', linewidth=2, alpha=0.8,
+                                marker='s' if is_short_pred else None,
+                                markersize=vol_ms, zorder=5)
+            else:
+                ax2.text(0.5, 0.5, '无成交量数据', transform=ax2.transAxes,
+                        ha='center', va='center', fontsize=12, color='gray')
 
             ax2.axvline(pred_start_time, color='orange', linestyle='--', linewidth=1.5, alpha=0.7)
 
@@ -1604,21 +1605,15 @@ class StockPredictor:
                     logger.error(f"保存图表失败: {str(save_error)}")
                     plot_path = None
 
-            # 在非交互环境中不显示图表，避免阻塞
-            # 注意：我们已经设置了Agg后端，所以plt.show()不会实际显示图像
-            try:
-                plt.show()  # 在Agg后端下这不会显示任何东西，只是为了兼容性
-                logger.info("图表显示调用完成")
-            except Exception as show_error:
-                logger.warning(f"图表显示时出现警告: {str(show_error)}")
-            
             logger.info("图表绘制流程完成")
             return plot_path
-            
+
         except Exception as e:
             logger.error(f"绘制图表失败: {str(e)}")
             logger.error("详细错误信息:", exc_info=True)
             return None
+        finally:
+            plt.close('all')
     
     def save_prediction_results(self, pred_df, symbol, metadata=None, is_future_forecast=False):
         """
@@ -1824,7 +1819,7 @@ class StockPredictor:
             'volatility_ratio': pred_volatility / hist_volatility if hist_volatility != 0 else float('inf'),
             'var_95': var_95,
             'max_drawdown': max_drawdown,
-            'sharpe_ratio': pred_returns.mean() / pred_returns.std() if pred_returns.std() != 0 else 0
+            'sharpe_ratio': pred_returns.mean() / pred_returns.std() * (252 ** 0.5) if pred_returns.std() != 0 else 0
         }
 
     def _evaluate_prediction_quality(self, historical_df, pred_df, is_future_forecast):
@@ -1926,7 +1921,7 @@ class StockPredictor:
     
     def run_prediction_pipeline(self, historical_df, x_df, x_timestamp, y_timestamp,
                                is_future_forecast, symbol, pred_len,
-                               T=1.0, top_p=0.9, sample_count=1, plot_lookback=1500,
+                               T=0.5, top_p=0.5, sample_count=1, plot_lookback=1500,
                                enable_advanced_preprocessing=False, price_normalization="none",
                                trend_adjustment=False, volatility_filter=False, config=None):
         """

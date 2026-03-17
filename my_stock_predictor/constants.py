@@ -32,7 +32,8 @@ LUNCH_END_MINUTE = 0
 # ==============================================================================
 TRADING_MINUTES_PER_DAY = 240  # A股每天交易4小时 = 240分钟
 TRADING_DAYS_PER_MONTH = 21    # 每月约21个交易日
-TRADING_DAYS_RATIO = 0.7       # 交易日占比约70%
+ANNUAL_TRADING_DAYS = 252              # 年化交易日数
+TRADING_DAYS_RATIO = ANNUAL_TRADING_DAYS / 365  # 交易日占比 ~0.69
 
 # ==============================================================================
 # 数据处理常量
@@ -66,15 +67,14 @@ VOLATILITY_LOW_THRESHOLD = 0.005      # 低波动性阈值
 MAX_REASONABLE_DEVIATION = 30.0       # 最大合理偏差百分比(%)
 MEDIUM_DEVIATION_THRESHOLD = 15.0     # 中等偏差阈值(%)
 VOLATILITY_RATIO_THRESHOLD = 0.1      # 波动率阈值(10%)
-PRICE_CHANGE_OUTLIER_THRESHOLD = 0.5  # 价格变化异常阈值(50%)
+PRICE_CHANGE_OUTLIER_THRESHOLD = 0.2  # 价格变化异常阈值(20%，覆盖科创板/创业板涨跌停)
 PRICE_CHANGE_WARNING_THRESHOLD = 0.1  # 价格变化警告阈值(10%)
 
 # 波动率合理性范围
 VOLATILITY_RATIO_MIN = 0.5
 VOLATILITY_RATIO_MAX = 2.0
 
-# 年化交易日数
-ANNUAL_TRADING_DAYS = 252
+# (ANNUAL_TRADING_DAYS 已在上方数据计算常量区定义)
 
 # ==============================================================================
 # 数据获取常量
@@ -97,7 +97,7 @@ CHUNK_DAYS_MAP = {
 }
 
 MAX_ATTEMPTS_MAP = {
-    'akshare': 8,
+    'akshare': 15,
     'baostock': 12,
     'yfinance': 12,
     'default': 12

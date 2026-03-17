@@ -37,17 +37,18 @@ class TechnicalAnalyzer:
     @staticmethod
     def calculate_rsi(series: pd.Series, window: int = 14) -> pd.Series:
         """
-        Calculate RSI (Relative Strength Index)
+        Calculate RSI (Relative Strength Index) using Wilder's smoothing (EMA)
         """
         delta = series.diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=window).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=window).mean()
+        gain = delta.where(delta > 0, 0).ewm(alpha=1/window, adjust=False).mean()
+        loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/window, adjust=False).mean()
 
         rs = gain / loss
         rsi = 100 - (100 / (1 + rs))
-        
-        # Handle division by zero if loss is 0
-        rsi = rsi.fillna(100) 
+
+        # loss=0 且 gain>0 -> RSI=100; gain=0 且 loss>0 -> RSI=0; 都为0 -> 50(中性)
+        rsi = rsi.where(loss != 0, np.where(gain > 0, 100, 50))
+        rsi = rsi.fillna(50)
         return rsi
 
     @staticmethod
@@ -72,8 +73,7 @@ class TechnicalAnalyzer:
         high_max = df['high'].rolling(window=n).max()
         
         rsv = (df['close'] - low_min) / (high_max - low_min) * 100
-        # Handle NaN
-        rsv = rsv.fillna(50)
+        rsv = rsv.replace([np.inf, -np.inf], np.nan).fillna(50)
         
         k = rsv.ewm(alpha=1/m1, adjust=False).mean()
         d = k.ewm(alpha=1/m2, adjust=False).mean()
@@ -127,10 +127,19 @@ class TechnicalAnalyzer:
         """
         if len(df) < 2:
             return {"summary": "数据不足", "signals": [], "warnings": []}
-            
+
+        required_cols = ['MA5', 'MA10', 'MA20', 'MACD', 'MACD_Signal', 'RSI', 'K', 'D', 'BB_Upper', 'BB_Lower']
+        missing = [c for c in required_cols if c not in df.columns]
+        if missing:
+            return {"summary": f"缺少指标列: {missing}", "signals": [], "warnings": []}
+
         last_row = df.iloc[-1]
         prev_row = df.iloc[-2]
-        
+
+        # 检查关键指标是否有 NaN（数据量不足时 MA20/MACD 等会是 NaN）
+        if pd.isna(last_row['MA20']) or pd.isna(last_row['MACD']):
+            return {"summary": "指标数据不足(需要至少26条数据)", "signals": [], "warnings": []}
+
         signals = []
         warnings = []
         trend_score = 0  # >0 bullish, <0 bearish
@@ -168,14 +177,16 @@ class TechnicalAnalyzer:
         # 3. RSI Analysis & Risk Warning
         if last_row['RSI'] > 80:
             warnings.append(f"RSI超买 ({last_row['RSI']:.1f}) - 短期回调风险大")
-            trend_score -= 1 # Overbought is bearish for short term
+            trend_score -= 1
         elif last_row['RSI'] > 70:
             warnings.append(f"RSI偏高 ({last_row['RSI']:.1f}) - 注意风险")
+            trend_score -= 0.5
         elif last_row['RSI'] < 20:
             warnings.append(f"RSI超卖 ({last_row['RSI']:.1f}) - 短期反弹机会")
-            trend_score += 1 # Oversold is bullish for short term
+            trend_score += 1
         elif last_row['RSI'] < 30:
-            signals.append(f"RSI低位 ({last_row['RSI']:.1f})")
+            warnings.append(f"RSI偏低 ({last_row['RSI']:.1f}) - 注意机会")
+            trend_score += 0.5
             
         # 4. KDJ Analysis
         if last_row['K'] > last_row['D'] and prev_row['K'] <= prev_row['D']:
