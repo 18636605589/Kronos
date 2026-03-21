@@ -1278,7 +1278,7 @@ class StockPredictor:
     
     def plot_prediction(self, historical_df, pred_df, symbol, is_future_forecast=False, save_plot=True,
                        plot_lookback=1500, enable_focus_mode=False, plot_lookback_days=None, prediction_highlight=True,
-                       raw_historical_df=None):
+                       raw_historical_df=None, run_dir=None):
         """
         绘制预测结果 - 智能时间轴显示，区分预测和回测模式
         """
@@ -1579,15 +1579,20 @@ class StockPredictor:
             plot_path = None
             if save_plot:
                 try:
-                    # --- 创建模式区分的结果子文件夹 ---
-                    mode_dir = 'future_forecast' if is_future_forecast else 'backtest'
-                    symbol_results_dir = os.path.join(self.results_dir, symbol, mode_dir)
-                    os.makedirs(symbol_results_dir, exist_ok=True)
-                    logger.info(f"创建结果目录: {symbol_results_dir}")
-
-                    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
                     mode_prefix = 'forecast' if is_future_forecast else 'backtest'
-                    plot_filename = f"{symbol}_{mode_prefix}_chart_{timestamp}.png"
+                    
+                    if run_dir:
+                        symbol_results_dir = run_dir
+                        plot_filename = f"{symbol}_{mode_prefix}_chart.png"
+                    else:
+                        # 兼容旧逻辑
+                        mode_dir = 'future_forecast' if is_future_forecast else 'backtest'
+                        symbol_results_dir = os.path.join(self.results_dir, symbol, mode_dir)
+                        os.makedirs(symbol_results_dir, exist_ok=True)
+                        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                        plot_filename = f"{symbol}_{mode_prefix}_chart_{timestamp}.png"
+                        
+                    logger.info(f"创建或使用结果目录: {symbol_results_dir}")
                     plot_path = os.path.join(symbol_results_dir, plot_filename)
 
                     logger.info(f"正在保存图表到: {plot_path}")
@@ -1615,7 +1620,7 @@ class StockPredictor:
         finally:
             plt.close('all')
     
-    def save_prediction_results(self, pred_df, symbol, metadata=None, is_future_forecast=False):
+    def save_prediction_results(self, pred_df, symbol, metadata=None, is_future_forecast=False, run_dir=None):
         """
         保存预测结果
         
@@ -1628,17 +1633,24 @@ class StockPredictor:
             str: 结果文件路径
         """
         try:
-            # --- 创建模式区分的结果子文件夹 ---
-            mode_dir = 'future_forecast' if is_future_forecast else 'backtest'
-            symbol_results_dir = os.path.join(self.results_dir, symbol, mode_dir)
-            os.makedirs(symbol_results_dir, exist_ok=True)
-
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
             mode_prefix = 'forecast' if is_future_forecast else 'backtest'
+            
+            if run_dir:
+                symbol_results_dir = run_dir
+                timestamp = os.path.basename(run_dir)
+                csv_filename = f"{symbol}_{mode_prefix}_data.csv"
+                json_filename = f"{symbol}_{mode_prefix}_metadata.json"
+            else:
+                # 兼容旧逻辑
+                mode_dir = 'future_forecast' if is_future_forecast else 'backtest'
+                symbol_results_dir = os.path.join(self.results_dir, symbol, mode_dir)
+                os.makedirs(symbol_results_dir, exist_ok=True)
+                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                csv_filename = f"{symbol}_{mode_prefix}_data_{timestamp}.csv"
+                json_filename = f"{symbol}_{mode_prefix}_metadata_{timestamp}.json"
 
-            # 保存预测数据
-            csv_filename = f"{symbol}_{mode_prefix}_data_{timestamp}.csv"
             csv_path = os.path.join(symbol_results_dir, csv_filename)
+            json_path = os.path.join(symbol_results_dir, json_filename)
             
             # 将索引重置为列，并确保列名为'timestamps'
             save_df = pred_df.reset_index()
@@ -1657,9 +1669,6 @@ class StockPredictor:
                 'data_points': len(pred_df),
                 'columns': list(pred_df.columns)
             })
-            
-            json_filename = f"{symbol}_{mode_prefix}_metadata_{timestamp}.json"
-            json_path = os.path.join(symbol_results_dir, json_filename)
             
             with open(json_path, 'w', encoding='utf-8') as f:
                 json.dump(metadata, f, ensure_ascii=False, indent=2, default=str)
@@ -1997,6 +2006,13 @@ class StockPredictor:
                 logger.error("预测结果分析失败")
                 return None
 
+            # 【新增强化】为本次预测运行生成唯一的目录结构
+            run_timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            mode_dir = "future_forecast" if is_future_forecast else "backtest"
+            run_dir = os.path.join(self.results_dir, symbol, mode_dir, run_timestamp)
+            os.makedirs(run_dir, exist_ok=True)
+            logger.info(f"本次运行独立目录: {run_dir}")
+
             # === 4. 绘制图表 ===
             logger.info("📊 生成可视化图表...")
             plot_path = self.plot_prediction(
@@ -2005,7 +2021,8 @@ class StockPredictor:
                 enable_focus_mode=config.get('enable_focus_mode', False) if config else False,
                 plot_lookback_days=config.get('plot_lookback_days') if config else None,
                 prediction_highlight=config.get('prediction_highlight', True) if config else True,
-                raw_historical_df=original_historical_df  # 传入原始历史数据用于正确显示价格尺度
+                raw_historical_df=original_historical_df,  # 传入原始历史数据用于正确显示价格尺度
+                run_dir=run_dir  # 传入本次运行专属目录
             )
             if plot_path is None:
                 logger.error("❌ 图表生成失败，plot_path为None")
@@ -2031,7 +2048,7 @@ class StockPredictor:
                 }
             }
 
-            csv_path = self.save_prediction_results(pred_df, symbol, metadata, is_future_forecast)
+            csv_path = self.save_prediction_results(pred_df, symbol, metadata, is_future_forecast, run_dir=run_dir)
 
             # === 6. 返回完整结果 ===
             results = {
