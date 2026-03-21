@@ -367,12 +367,13 @@ class UnifiedPredictor:
         if is_future_mode:
             # --- 未来预测模式 ---
             print("   - 模式: 未来预测")
-            # 预测的输入数据是所有我们能获取到的历史数据
+            # 【修复】严格按配置裁剪模型输入上下文，避免传入全部历史数据导致窗口不一致
+            subset_df = df.tail(lookback_steps).reset_index(drop=True)
             if config.get('use_close_only', False):
-                x_df = df[['close']]
+                x_df = subset_df[['close']].copy()
             else:
-                x_df = df[['open', 'high', 'low', 'close', 'volume', 'amount']]
-            x_timestamp = df['timestamps']
+                x_df = subset_df[['open', 'high', 'low', 'close', 'volume', 'amount']].copy()
+            x_timestamp = subset_df['timestamps'].copy()
             # 生成未来的时间戳
             y_timestamp = self._generate_future_timestamps(df['timestamps'].iloc[-1], pred_len_steps, config['period'])
             if y_timestamp is None:
@@ -641,19 +642,17 @@ class UnifiedPredictor:
         mae = np.mean(np.abs(true_close - pred_close))
         mape = np.mean(np.abs((true_close - pred_close) / true_close)) * 100
 
-        # 方向准确率：多点用 diff，单点用与历史最后收盘价比较
-        if len(true_close) >= 2:
-            true_diff = true_close.diff().dropna()
-            pred_diff = pred_close.diff().dropna()
-            if len(true_diff) > 0 and len(pred_diff) > 0:
-                td_a, pd_a = np.sign(true_diff).align(np.sign(pred_diff), join='inner')
-                direction_accuracy = np.mean(td_a == pd_a) * 100 if len(td_a) > 0 else 0.0
-            else:
-                direction_accuracy = 0.0
-        elif historical_last_close is not None and len(true_close) == 1:
-            # 单点预测：与入场价（历史最后收盘价）比较涨跌方向
-            true_dir = 1 if true_close.iloc[0] > historical_last_close else -1
-            pred_dir = 1 if pred_close.iloc[0] > historical_last_close else -1
+        # 【修复】方向准确率：更贴合交易实战的绝对方向评估（期末点位相对于期初基点的涨跌）
+        if historical_last_close is not None:
+            # 以历史最后一个真实收盘点位作为入场参考点
+            base_price = historical_last_close
+            true_dir = 1 if true_close.iloc[-1] > base_price else -1
+            pred_dir = 1 if pred_close.iloc[-1] > base_price else -1
+            direction_accuracy = 100.0 if true_dir == pred_dir else 0.0
+        elif len(true_close) >= 2:
+            # 如果未提供 historical_last_close，则用序列内起止点对比
+            true_dir = 1 if true_close.iloc[-1] > true_close.iloc[0] else -1
+            pred_dir = 1 if pred_close.iloc[-1] > pred_close.iloc[0] else -1
             direction_accuracy = 100.0 if true_dir == pred_dir else 0.0
         else:
             direction_accuracy = 0.0
@@ -1054,11 +1053,19 @@ class UnifiedPredictor:
                     # MAPE
                     mape = float(np.mean(np.abs((true_close - pred_close) / true_close)) * 100)
 
-                    # 方向准确率（每个时间第一个点相对上一个点的涨跌方向）
-                    true_dir = (true_close.diff().dropna() > 0)
-                    pred_dir = (pred_close.diff().dropna() > 0)
-                    true_dir_a, pred_dir_a = true_dir.align(pred_dir, join='inner')
-                    dir_acc = float((true_dir_a == pred_dir_a).mean() * 100) if len(true_dir_a) > 0 else 0.0
+                    # 【修复】方向准确率：期末数据点相对于预测前历史最后一个数据点的绝对涨跌方向
+                    hist_before_pred = historical_df[historical_df['timestamps'] < pred_df.index.min()]
+                    if not hist_before_pred.empty:
+                        base_price = hist_before_pred['close'].iloc[-1]
+                        true_is_up = true_close.iloc[-1] > base_price
+                        pred_is_up = pred_close.iloc[-1] > base_price
+                        dir_acc = 100.0 if true_is_up == pred_is_up else 0.0
+                    elif len(true_close) >= 2:
+                        true_is_up = true_close.iloc[-1] > true_close.iloc[0]
+                        pred_is_up = pred_close.iloc[-1] > pred_close.iloc[0]
+                        dir_acc = 100.0 if true_is_up == pred_is_up else 0.0
+                    else:
+                        dir_acc = 0.0
 
                     results.append({
                         'window': win_label,
