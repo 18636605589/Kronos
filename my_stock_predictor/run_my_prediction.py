@@ -162,6 +162,19 @@ PREDICTION_CONFIG = {
     # 将历史数据按时间顺序切成 N 段，每段独立跑回测，取均值评估真实泛化性能
     "rolling_windows": 5,            # 滚动窗口数量（建议 3-8，越多越可信但越慢）
     "rolling_use_latest_ratio": 0.4, # 保留最近该比例的数据不用于 tune（作为验证集）
+
+    # --- Tune 模式配置（--mode tune）---
+    # 升级后的 tune 流程:
+    # 1. 在 tune 集上切 N 个滚动窗口, 每窗跑 tune_sample_count 采样, 按综合得分排序
+    # 2. 取 Top-K 参数在预留的 val 集上二次评估, 选 val 综合得分最优者作为最终参数
+    # 这样可以避免单窗口 tune 选出"恰好在那段时间好"的过拟合参数, 提升参数泛化性。
+    "tune_windows": 3,              # Tune 使用的滚动窗口数 (自动根据数据量降级, 最低 1)
+    "tune_sample_count": 5,         # Tune 时每组参数的采样数 (原硬编码 3, 提高到 5 降噪)
+    "tune_scoring": "combined",     # 评分方式: "combined" = MAPE + 方向准确率综合; "mape_only" = 仅 MAPE
+    "tune_dir_weight": 30.0,        # 综合评分中方向准确率的权重 (方向错惩罚 dir_weight 分)
+    "tune_top_k_validate": 3,       # Tune 后在 val 集上二次评估的 Top-K 候选数量 (0=跳过二次验证)
+    "tune_val_windows": 2,          # Val 二次验证切的滚动窗口数 (自动根据数据量降级, 最低 1)
+    "random_seed": 42,              # 固定随机种子, 让 tune 结果可复现
 }
 # ==============================================================================
 
@@ -288,6 +301,183 @@ class UnifiedPredictor:
             results_dir=results_dir,
             enable_adaptive_tuning=enable_adaptive_tuning
         )
+
+    # ==========================================================================
+    # Tune 专用工具方法
+    # ==========================================================================
+
+    @staticmethod
+    def _set_random_seed(seed):
+        """
+        固定 numpy / random / torch 的随机种子, 让 tune 结果尽量可复现.
+        对存在的库才设置, 某些平台 (torch.mps) 可能不支持 manual_seed, 静默跳过.
+        """
+        if seed is None:
+            return
+        try:
+            seed_int = int(seed)
+        except (TypeError, ValueError):
+            return
+
+        np.random.seed(seed_int)
+        try:
+            import random as _random
+            _random.seed(seed_int)
+        except ImportError:
+            pass
+        try:
+            import torch  # type: ignore
+            torch.manual_seed(seed_int)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(seed_int)
+            # MPS 后端在部分 PyTorch 版本才有 manual_seed, 容错处理
+            mps_mod = getattr(torch, 'mps', None)
+            if mps_mod is not None and hasattr(mps_mod, 'manual_seed'):
+                try:
+                    mps_mod.manual_seed(seed_int)
+                except Exception:
+                    pass
+        except ImportError:
+            pass
+
+    @staticmethod
+    def _make_rolling_windows(df, lookback_steps, pred_len_steps, n_windows):
+        """
+        从 df 末尾向前切出最多 n_windows 个不重叠的回测窗口.
+
+        每个窗口长度 = lookback_steps + pred_len_steps.
+        数据量不足时自动降级到能容纳的最大窗口数; 完全不够则返回空列表.
+        返回顺序为从旧到新, 方便日志按时间顺序输出.
+
+        Args:
+            df: 已排序的完整数据 DataFrame
+            lookback_steps: 回溯步数
+            pred_len_steps: 预测步数
+            n_windows: 期望的窗口数量
+
+        Returns:
+            List[pd.DataFrame]: 每项是 reset_index 后的切片 DataFrame
+        """
+        window_size = lookback_steps + pred_len_steps
+        if window_size <= 0 or df is None or len(df) < window_size:
+            return []
+
+        try:
+            requested = max(1, int(n_windows or 1))
+        except (TypeError, ValueError):
+            requested = 1
+
+        max_windows = max(1, len(df) // window_size)
+        actual_n = min(requested, max_windows)
+
+        windows = []
+        for i in range(actual_n):
+            end_pos = len(df) - i * window_size
+            start_pos = end_pos - window_size
+            if start_pos < 0:
+                break
+            chunk = df.iloc[start_pos:end_pos].reset_index(drop=True)
+            windows.append(chunk)
+
+        windows.reverse()  # 旧 -> 新
+        return windows
+
+    def _evaluate_param_combo(self, *, predictor, historical_df, windows,
+                              T, top_p, sample_count, lookback_steps,
+                              pred_len_steps, symbol, use_close_only,
+                              config, dir_weight):
+        """
+        对一组 (T, top_p) 在多个窗口上评估, 返回综合指标字典.
+
+        - MAPE: 每个窗口预测区与真实区的平均绝对百分比误差, 多窗取均值
+        - 方向准确率: 以回溯期末收盘价为基准, 判断"预测末点涨跌方向"是否与真实方向一致
+        - 综合得分 (越低越好): avg_mape + dir_weight * (100 - avg_dir_acc) / 100
+          方向错的参数会被 dir_weight 分狠狠惩罚, 避免选出"MAPE低但方向反"的假优参数.
+
+        Returns:
+            dict: 包含 T/top_p/mapes/dir_accs/avg_mape/avg_dir_acc/score/n_valid/errors
+        """
+        mapes = []
+        dir_accs = []
+        errors = 0
+
+        prev_level = predictor.logger.level
+        predictor.logger.setLevel(logging.WARNING)
+
+        try:
+            for subset_df in windows:
+                try:
+                    x_df, x_ts, y_ts, gt = self._split_backtest_window(
+                        subset_df, lookback_steps, pred_len_steps, use_close_only
+                    )
+
+                    pred_results = predictor.run_prediction_pipeline(
+                        historical_df=historical_df,
+                        x_df=x_df,
+                        x_timestamp=x_ts,
+                        y_timestamp=y_ts,
+                        is_future_forecast=False,
+                        symbol=symbol,
+                        pred_len=pred_len_steps,
+                        T=T,
+                        top_p=top_p,
+                        sample_count=sample_count,
+                        plot_lookback=lookback_steps,
+                        enable_advanced_preprocessing=config.get('enable_advanced_preprocessing', False),
+                        price_normalization=config.get('price_normalization', 'none'),
+                        trend_adjustment=config.get('trend_adjustment', False),
+                        volatility_filter=config.get('volatility_filter', False),
+                        config=config
+                    )
+
+                    if not pred_results:
+                        errors += 1
+                        continue
+
+                    pred_df = pred_results['prediction']
+                    true_close, pred_close = gt['close'].align(
+                        pred_df['close'], join='inner'
+                    )
+                    if len(true_close) == 0 or (true_close == 0).any():
+                        errors += 1
+                        continue
+
+                    mape = float(
+                        np.mean(np.abs((true_close - pred_close) / true_close)) * 100
+                    )
+                    base_price = float(x_df['close'].iloc[-1])
+                    true_dir = 1 if float(true_close.iloc[-1]) > base_price else -1
+                    pred_dir = 1 if float(pred_close.iloc[-1]) > base_price else -1
+                    dir_acc = 100.0 if true_dir == pred_dir else 0.0
+
+                    mapes.append(mape)
+                    dir_accs.append(dir_acc)
+                except Exception:
+                    errors += 1
+                    continue
+        finally:
+            predictor.logger.setLevel(prev_level)
+
+        if not mapes:
+            return {
+                'T': T, 'top_p': top_p,
+                'mapes': [], 'dir_accs': [],
+                'avg_mape': float('nan'), 'avg_dir_acc': float('nan'),
+                'score': float('inf'),
+                'n_valid': 0, 'errors': errors,
+            }
+
+        avg_mape = float(np.mean(mapes))
+        avg_dir_acc = float(np.mean(dir_accs))
+        score = avg_mape + dir_weight * (100.0 - avg_dir_acc) / 100.0
+
+        return {
+            'T': T, 'top_p': top_p,
+            'mapes': mapes, 'dir_accs': dir_accs,
+            'avg_mape': avg_mape, 'avg_dir_acc': avg_dir_acc,
+            'score': float(score),
+            'n_valid': len(mapes), 'errors': errors,
+        }
 
     def _calculate_steps(self, duration_str, period):
         """
@@ -780,44 +970,53 @@ class UnifiedPredictor:
 
     def run_tuning(self, config):
         """
-        自动调优参数：遍历T和top_p组合，寻找最佳MAPE
+        自动调优参数（增强版）：
+            1. 切多个滚动窗口代替单窗口, 减少单时段的偶然性
+            2. 按"MAPE + 方向准确率"综合评分, 避免选出"MAPE 低但方向反"的假优参数
+            3. Top-K 候选在预留的 val 集上二次评估, 进一步挑出泛化最好的参数
+            4. 固定随机种子, 让 tune 结果尽量可复现
+
+        相关 config 项:
+            tune_windows, tune_sample_count, tune_scoring, tune_dir_weight,
+            tune_top_k_validate, tune_val_windows, random_seed
         """
-        print("🚀 开始自动参数调优...")
-        print("="*60)
-        
-        # 1. 获取数据 (复用 run_prediction 的逻辑 - 简化版)
+        print("🚀 开始自动参数调优（多窗口 + 综合评分 + 验证集二次确认）...")
+        print("=" * 60)
+
+        seed = config.get('random_seed', 42)
+        self._set_random_seed(seed)
+        if seed is not None:
+            print(f"🎲 已固定随机种子: {seed}（结果可复现）")
+
         lookback_steps = self._calculate_steps(config['lookback_duration'], config['period'])
         pred_len_steps = self._calculate_steps(config['pred_len_duration'], config['period'])
         required_total = lookback_steps + pred_len_steps
-        
+
         print(f"📊 正在获取数据用于调优 (回溯: {lookback_steps}, 预测: {pred_len_steps})...")
 
         df, filepath, _ = self._fetch_data(config)
 
         if df is None:
-            print(f"❌ 未能获取到数据，无法进行调优。")
+            print("❌ 未能获取到数据，无法进行调优。")
             return
 
-        # 检查数据量是否满足预测所需的最低要求（lookback + pred_len）
         if len(df) < required_total:
-            print(f"❌ 数据量不足 ({len(df)})，调优所需最少 {required_total} 条。请尝试增加 fallback_fetch_days 或缩短 lookback_duration。")
+            print(f"❌ 数据量不足 ({len(df)})，调优所需最少 {required_total} 条。"
+                  f"请尝试增加 fallback_fetch_days 或缩短 lookback_duration。")
             return
 
-        # 裁剪数据: 最多保留 30000 条 (多多益善，但有上限)
         max_limit = 30000
         if len(df) > max_limit:
             print(f"✂️ 数据量 ({len(df)}) 超过上限 {max_limit}，截取最新的 {max_limit} 条用于调优...")
             df = df.tail(max_limit).reset_index(drop=True)
         else:
             print(f"✅ 使用全部可用数据 ({len(df)} 条) 进行调优...")
-        
-        # 修复数据泄露：tune 应当使用过去的数据找参数，保留最新数据做验证
+
+        # 防数据泄露：把最新一部分切出来作为 val, 只用过去数据做 tune
         use_ratio = config.get('rolling_use_latest_ratio', 0.4)
         if use_ratio >= 1.0 or use_ratio <= 0:
             use_ratio = 0.4
-            
-        # 最少需要一个完整的回测窗口（lookback + pred）
-        # 我们把最新的一部分数据（如40%或至少一个预测窗口长度）切掉不给 tune 用
+
         reserve_len_for_val = max(int(len(df) * use_ratio), pred_len_steps)
         if len(df) - reserve_len_for_val < required_total:
             print(f"⚠️ 数据总长度({len(df)})扣除验证集({reserve_len_for_val})后不足 required_total({required_total})")
@@ -825,128 +1024,240 @@ class UnifiedPredictor:
             reserve_len_for_val = pred_len_steps
 
         if len(df) - reserve_len_for_val < required_total:
-             print("❌ 数据极度匮乏，无法在防泄露前提下进行 tune，请增大 fallback_fetch_days。")
-             return
+            print("❌ 数据极度匮乏，无法在防泄露前提下进行 tune，请增大 fallback_fetch_days。")
+            return
 
         tune_df = df.iloc[:-reserve_len_for_val].reset_index(drop=True)
-        print(f"✂️ 为防数据泄露，保留最新 {reserve_len_for_val} 条数据仅作验证，本次 tune 使用前 {len(tune_df)} 条数据。")
+        val_df = df.tail(reserve_len_for_val).reset_index(drop=True)
+        print(f"✂️ 为防数据泄露，保留最新 {reserve_len_for_val} 条数据作验证集，"
+              f"本次 tune 使用前 {len(tune_df)} 条数据。")
 
-        subset_df = tune_df.tail(required_total).reset_index(drop=True)
-        x_df, x_timestamp, y_timestamp, ground_truth = self._split_backtest_window(
-            subset_df, lookback_steps, pred_len_steps,
-            use_close_only=config.get('use_close_only', False)
+        # 切 tune 窗口（自动根据数据量降级）
+        requested_tune_windows = int(config.get('tune_windows', 3) or 1)
+        tune_windows = self._make_rolling_windows(
+            tune_df, lookback_steps, pred_len_steps, requested_tune_windows
         )
+        if not tune_windows:
+            print("❌ 无法在 tune 集上切出有效窗口，请增大 fallback_fetch_days 或缩短 lookback_duration。")
+            return
 
-        # 3. 定义参数网格
+        if len(tune_windows) < requested_tune_windows:
+            print(f"⚠️ tune 集仅够切 {len(tune_windows)} 个不重叠窗口 "
+                  f"（请求 {requested_tune_windows}）, 已自动降级。")
+        else:
+            print(f"🪟 tune 集切出 {len(tune_windows)} 个不重叠滚动窗口")
+
+        # 参数网格
         T_list = [0.1, 0.3, 0.5, 0.7, 0.9]
         top_p_list = [0.5, 0.6, 0.7, 0.8, 0.9, 0.95]
 
-        best_mape = float('inf')
-        best_params = None
-        results = []
-
         total_combinations = len(T_list) * len(top_p_list)
-        print(f"🔍 将测试 {total_combinations} 组参数组合...")
-        print("-" * 60)
-        print(f"{'T':<6} | {'top_p':<6} | {'MAPE':<10} | {'Status'}")
-        print("-" * 60)
+        tune_sample_count = int(config.get('tune_sample_count', 5) or 5)
+        dir_weight = float(config.get('tune_dir_weight', 30.0))
+        scoring_mode = str(config.get('tune_scoring', 'combined')).lower()
+        if scoring_mode not in ('combined', 'mape_only'):
+            scoring_mode = 'combined'
 
-        # 初始化预测器
+        print(f"🔍 将测试 {total_combinations} 组参数组合 | "
+              f"每组 {len(tune_windows)} 窗口 × {tune_sample_count} 采样 = "
+              f"{total_combinations * len(tune_windows) * tune_sample_count} 次模型调用")
+        print(f"🧮 评分方式: {scoring_mode}"
+              + (f" (方向权重 = {dir_weight})" if scoring_mode == 'combined' else ""))
+        print("-" * 72)
+        print(f"{'T':<5} | {'top_p':<6} | {'MAPE%':<8} | {'Dir%':<6} | {'Score':<8} | {'n/err':<8} | Status")
+        print("-" * 72)
+
         tuning_results_dir = os.path.join(SCRIPT_DIR, "tuning_results")
         predictor = self._build_predictor(
             results_subdir="tuning_results",
             enable_adaptive_tuning=False
         )
 
-        # 4. 遍历参数
-        count = 0
+        results = []
         for T in T_list:
             for top_p in top_p_list:
-                count += 1
+                metric = self._evaluate_param_combo(
+                    predictor=predictor,
+                    historical_df=tune_df,
+                    windows=tune_windows,
+                    T=T,
+                    top_p=top_p,
+                    sample_count=tune_sample_count,
+                    lookback_steps=lookback_steps,
+                    pred_len_steps=pred_len_steps,
+                    symbol=config['symbol'],
+                    use_close_only=config.get('use_close_only', False),
+                    config=config,
+                    dir_weight=dir_weight
+                )
 
-                try:
-                    # 运行预测: 临时抑制日志输出以保持整洁
-                    predictor.logger.setLevel(logging.WARNING)
-                    
-                    pred_results = predictor.run_prediction_pipeline(
-                        historical_df=tune_df,
-                        x_df=x_df,
-                        x_timestamp=x_timestamp,
-                        y_timestamp=y_timestamp,
-                        is_future_forecast=False,
-                        symbol=config['symbol'],
-                        pred_len=pred_len_steps,
-                        T=T,
-                        top_p=top_p,
-                        sample_count=3,
-                        plot_lookback=lookback_steps,
-                        enable_advanced_preprocessing=config.get('enable_advanced_preprocessing', False),
-                        price_normalization=config.get('price_normalization', 'none'),
-                        trend_adjustment=config.get('trend_adjustment', False),
-                        volatility_filter=config.get('volatility_filter', False),
-                        config=config
-                    )
-                    
-                    predictor.logger.setLevel(logging.INFO) # 恢复日志
-                    
-                    if pred_results:
-                        pred_df = pred_results['prediction']
-                        # 显式对齐索引，避免时间戳错位导致 MAPE 计算出 NaN
-                        true_close = ground_truth['close']
-                        pred_close = pred_df['close']
-                        true_close_aligned, pred_close_aligned = true_close.align(pred_close, join='inner')
-                        if len(true_close_aligned) == 0:
-                            print(f"{T:<6.1f} | {top_p:<6.1f} | {'NoOverlap':<10} | ❌")
-                            continue
-                        mape = np.mean(np.abs((true_close_aligned - pred_close_aligned) / true_close_aligned)) * 100
-                        
-                        results.append({'T': T, 'top_p': top_p, 'mape': mape})
-                        print(f"{T:<6.1f} | {top_p:<6.1f} | {mape:<9.2f}% | ✅")
-                        
-                        if mape < best_mape:
-                            best_mape = mape
-                            best_params = {'T': T, 'top_p': top_p}
-                    else:
-                        print(f"{T:<6.1f} | {top_p:<6.1f} | {'Failed':<10} | ❌")
-                        
-                except Exception as e:
-                    print(f"{T:<6.1f} | {top_p:<6.1f} | {'Error':<10} | ❌ ({str(e)})")
-        
-        print("-" * 60)
-        
-        # 保存详细报告
-        if results:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            report_dir = os.path.join(tuning_results_dir, config['symbol'], 'tuning_reports')
-            os.makedirs(report_dir, exist_ok=True)
-            
-            # 1. 保存为 CSV (方便Excel查看)
-            results_df = pd.DataFrame(results)
-            results_df = results_df.sort_values('mape') # 按效果排序
-            csv_path = os.path.join(report_dir, f"tuning_results_{timestamp}.csv")
-            results_df.to_csv(csv_path, index=False)
-            
-            # 2. 保存最佳参数为 JSON
-            best_result = results_df.iloc[0].to_dict()
-            json_path = os.path.join(report_dir, f"best_params_{timestamp}.json")
-            with open(json_path, 'w', encoding='utf-8') as f:
-                json.dump(best_result, f, indent=4, ensure_ascii=False)
-                
-            print(f"\n📄 详细调优报告已保存:")
-            print(f"   - CSV表格: {csv_path}")
-            print(f"   - 最佳参数: {json_path}")
+                if scoring_mode == 'mape_only' and metric['n_valid'] > 0:
+                    metric['score'] = float(metric['avg_mape'])
 
-        if best_params:
-            print(f"\n🏆 调优完成！最佳参数组合:")
-            print(f"   T = {best_params['T']}")
-            print(f"   top_p = {best_params['top_p']}")
-            print(f"   最佳 MAPE = {best_mape:.2f}%")
-            print("\n💡 建议更新 run_my_prediction.py 中的 PREDICTION_CONFIG:")
-            print(f"    \"T\": {best_params['T']},")
-            print(f"    \"top_p\": {best_params['top_p']},")
-        else:
+                results.append(metric)
+
+                if metric['n_valid'] == 0:
+                    print(f"{T:<5.2f} | {top_p:<6.2f} | {'-':<8} | {'-':<6} | "
+                          f"{'-':<8} | {metric['n_valid']}/{metric['errors']:<6} | ❌ NoValid")
+                else:
+                    status = '✅' if metric['errors'] == 0 else '⚠️'
+                    print(f"{T:<5.2f} | {top_p:<6.2f} | {metric['avg_mape']:<8.3f} | "
+                          f"{metric['avg_dir_acc']:<6.1f} | {metric['score']:<8.3f} | "
+                          f"{metric['n_valid']}/{metric['errors']:<6} | {status}")
+
+        print("-" * 72)
+
+        valid_results = [r for r in results if r['n_valid'] > 0]
+        if not valid_results:
             print("\n❌ 调优失败，未找到有效参数组合。")
-            print("="*60)
+            print("=" * 60)
+            return
+
+        # 按综合得分排序, 得分越低越好
+        valid_results.sort(key=lambda r: r['score'])
+
+        # Top-K 在 val 集上做二次评估（如果配置启用且数据足够）
+        top_k = int(config.get('tune_top_k_validate', 3) or 0)
+        val_windows_req = int(config.get('tune_val_windows', 2) or 1)
+        val_windows = self._make_rolling_windows(
+            val_df, lookback_steps, pred_len_steps, val_windows_req
+        ) if top_k > 0 else []
+
+        val_results = []
+        final_source = 'tune'
+        final_metric = valid_results[0]
+
+        if top_k > 0 and val_windows:
+            print(f"\n🎯 在验证集上二次评估 Top-{min(top_k, len(valid_results))} 候选 "
+                  f"({len(val_windows)} 个窗口 × {tune_sample_count} 采样)...")
+            print("-" * 72)
+            print(f"{'T':<5} | {'top_p':<6} | {'Val MAPE%':<10} | {'Val Dir%':<9} | {'Val Score':<10} | Status")
+            print("-" * 72)
+
+            for candidate in valid_results[:top_k]:
+                val_metric = self._evaluate_param_combo(
+                    predictor=predictor,
+                    historical_df=val_df,
+                    windows=val_windows,
+                    T=candidate['T'],
+                    top_p=candidate['top_p'],
+                    sample_count=tune_sample_count,
+                    lookback_steps=lookback_steps,
+                    pred_len_steps=pred_len_steps,
+                    symbol=config['symbol'],
+                    use_close_only=config.get('use_close_only', False),
+                    config=config,
+                    dir_weight=dir_weight
+                )
+
+                if scoring_mode == 'mape_only' and val_metric['n_valid'] > 0:
+                    val_metric['score'] = float(val_metric['avg_mape'])
+
+                val_results.append(val_metric)
+
+                if val_metric['n_valid'] == 0:
+                    print(f"{candidate['T']:<5.2f} | {candidate['top_p']:<6.2f} | "
+                          f"{'-':<10} | {'-':<9} | {'-':<10} | ❌ NoValid")
+                else:
+                    print(f"{candidate['T']:<5.2f} | {candidate['top_p']:<6.2f} | "
+                          f"{val_metric['avg_mape']:<10.3f} | {val_metric['avg_dir_acc']:<9.1f} | "
+                          f"{val_metric['score']:<10.3f} | ✅")
+            print("-" * 72)
+
+            valid_val = [v for v in val_results if v['n_valid'] > 0]
+            if valid_val:
+                valid_val.sort(key=lambda r: r['score'])
+                final_metric = valid_val[0]
+                final_source = 'val'
+            else:
+                print("⚠️ 验证集评估未得到任何有效结果, 回退到 tune 集最佳参数。")
+        elif top_k > 0 and not val_windows:
+            print(f"\n⚠️ 验证集数据量不足切出窗口 (需要 >= {lookback_steps + pred_len_steps} 条)，"
+                  "跳过二次验证, 直接采用 tune 集最佳参数。")
+
+        # 保存详细报告
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        report_dir = os.path.join(tuning_results_dir, config['symbol'], 'tuning_reports')
+        os.makedirs(report_dir, exist_ok=True)
+
+        # 1) 汇总 CSV: tune 所有组合
+        tune_rows = []
+        for r in results:
+            tune_rows.append({
+                'T': r['T'],
+                'top_p': r['top_p'],
+                'tune_avg_mape': r['avg_mape'],
+                'tune_avg_dir_acc': r['avg_dir_acc'],
+                'tune_score': r['score'],
+                'n_valid': r['n_valid'],
+                'errors': r['errors'],
+            })
+        tune_df_report = pd.DataFrame(tune_rows).sort_values('tune_score')
+        tune_csv_path = os.path.join(report_dir, f"tuning_results_{timestamp}.csv")
+        tune_df_report.to_csv(tune_csv_path, index=False)
+
+        # 2) 验证集 CSV（如有）
+        val_csv_path = None
+        if val_results:
+            val_rows = []
+            for v in val_results:
+                val_rows.append({
+                    'T': v['T'],
+                    'top_p': v['top_p'],
+                    'val_avg_mape': v['avg_mape'],
+                    'val_avg_dir_acc': v['avg_dir_acc'],
+                    'val_score': v['score'],
+                    'n_valid': v['n_valid'],
+                    'errors': v['errors'],
+                })
+            val_df_report = pd.DataFrame(val_rows).sort_values('val_score')
+            val_csv_path = os.path.join(report_dir, f"tuning_val_results_{timestamp}.csv")
+            val_df_report.to_csv(val_csv_path, index=False)
+
+        # 3) 最终参数 JSON
+        best_result_payload = {
+            'symbol': config['symbol'],
+            'period': config['period'],
+            'lookback_duration': config['lookback_duration'],
+            'pred_len_duration': config['pred_len_duration'],
+            'scoring_mode': scoring_mode,
+            'dir_weight': dir_weight,
+            'tune_windows_used': len(tune_windows),
+            'val_windows_used': len(val_windows) if val_results else 0,
+            'tune_sample_count': tune_sample_count,
+            'random_seed': seed,
+            'final_source': final_source,  # 'val' 表示最终参数来自 val 二次验证
+            'best_params': {
+                'T': final_metric['T'],
+                'top_p': final_metric['top_p'],
+            },
+            'best_metrics': {
+                'avg_mape': final_metric['avg_mape'],
+                'avg_dir_acc': final_metric['avg_dir_acc'],
+                'score': final_metric['score'],
+            },
+        }
+        json_path = os.path.join(report_dir, f"best_params_{timestamp}.json")
+        with open(json_path, 'w', encoding='utf-8') as f:
+            json.dump(best_result_payload, f, indent=4, ensure_ascii=False, default=float)
+
+        print("\n📄 详细调优报告已保存:")
+        print(f"   - tune 汇总 CSV: {tune_csv_path}")
+        if val_csv_path:
+            print(f"   - val  汇总 CSV: {val_csv_path}")
+        print(f"   - 最终参数 JSON: {json_path}")
+
+        print("\n🏆 调优完成！最终选定参数:")
+        print(f"   来源: {'验证集二次验证' if final_source == 'val' else 'tune 集最佳'}")
+        print(f"   T     = {final_metric['T']}")
+        print(f"   top_p = {final_metric['top_p']}")
+        print(f"   平均 MAPE         = {final_metric['avg_mape']:.3f}%")
+        print(f"   平均方向准确率    = {final_metric['avg_dir_acc']:.1f}%")
+        print(f"   综合得分 (越低越好) = {final_metric['score']:.3f}")
+        print("\n💡 建议更新 run_my_prediction.py 中的 PREDICTION_CONFIG:")
+        print(f"    \"T\": {final_metric['T']},")
+        print(f"    \"top_p\": {final_metric['top_p']},")
+        print("=" * 60)
 
     def _estimate_required_days(self, required_points, period):
         """根据周期估算需要的最少日历天数（非交易日数）"""
